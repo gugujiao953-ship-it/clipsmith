@@ -1441,3 +1441,65 @@ MIUI 在应用更新后会自动撤销无障碍授权 —— 也就是说每装�
 
 设置页顶部那行状态就是为此加的：正常显示「✓ 复制监听已连接」，
 被撤销时显示「✕ 复制监听未开启（点这里去开启）」，点一下直达系统设置。
+
+## v6.11 「用着用着又失效」的真凶：force-stop 会关掉无障碍
+
+这版把无障碍真正开起来跑了完整链路，同时挖出两个真问题。
+
+### 1. 强行停止应用 = 系统关掉它的无障碍服务
+
+测试时的固定动作：
+
+```
+adb shell am force-stop com.zhuanz.bilislicer   # 冷启动，干净
+adb shell am start -n .../.MainActivity
+```
+
+结果每次打开完无障碍，下一次冷启动就又变回：
+
+```
+enabled_accessibility_services = null
+accessibility_enabled = 0
+```
+
+原因是系统认为「用户强制停止了应用」，于是把它的无障碍服务一起停掉。
+**用户在最近任务里划掉应用，效果完全一样** —— 这就是「用一阵子又不好使」的由来。
+
+对照实验：用 `am start` 直接启动（不 force-stop）时，安装之后无障碍也保得住，
+服务状态 `settings get secure enabled_accessibility_services` 一直是本包。
+
+### 2. 服务明明连着，界面却显示「未开启」
+
+修完第一个问题后发现：`dumpsys` 里 `label=片匠` 说明服务在跑，
+但设置页那行还是「✕ 复制监听未开启」。
+
+原因：
+
+```java
+Settings.Secure.getString(cr, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+// Android 10+ 普通应用读这个键被拦，永远拿到 null
+```
+
+改成走 `AccessibilityManager.getEnabledAccessibilityServiceList()`（不需要权限、返回真实状态），
+并让界面以 `ClipWatchService.connected` 为准（服务真的连着），勾选状态只用来区分
+「勾了但没跑」和「压根没勾」。
+
+### 3. 把提示挪到主界面
+
+原来只有设置页里那一行，藏得太深。现在主界面 chips 下面有一条：
+
+```
+⚠ 复制监听已关闭（复制链接不会自动处理）· 点这里开启
+```
+
+点击直达系统无障碍设置；服务连上后回来提示条自动消失（实测）。
+
+### 验证结果
+
+| 环节 | 结果 |
+|---|---|
+| 无障碍开启 | `Bound services: Service[label=片匠]` ✓ |
+| 后台复制（浏览器地址栏复制） | `copy click -> read(after 450ms)` → `panel shown` ✓ |
+| 提示条（关闭时） | 主界面显示，点击跳系统设置 ✓ |
+| 提示条（开启后） | 自动消失 ✓ |
+| 前台识别 | 复制后回到应用，仍会自动入队 ✓ |

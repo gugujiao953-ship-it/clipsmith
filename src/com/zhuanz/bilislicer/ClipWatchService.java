@@ -19,17 +19,31 @@ public class ClipWatchService extends AccessibilityService {
     /** 服务是否连着。国产 ROM 会随时关掉它，界面靠这个状态提示用户 */
     public static volatile boolean connected = false;
 
-    /** 系统里这个无障碍服务是否仍被勾选 */
+    /**
+     * 系统里这个无障碍服务是否被勾选。
+     * 注意：不要读 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES —— Android 10+ 普通应用
+     * 读这个键会被拦，永远拿到 null，结果就是「服务明明连着，界面却显示未开启」。
+     * 走 AccessibilityManager 的已启用列表才准，而且不需要任何权限。
+     */
     public static boolean enabledInSettings(Context c) {
         try {
-            String key = c.getPackageName() + "/" + ClipWatchService.class.getName();
-            String flat = android.provider.Settings.Secure.getString(
-                    c.getContentResolver(),
-                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            return flat != null && flat.toLowerCase().contains(key.toLowerCase());
-        } catch (Throwable t) {
-            return false;
+            android.view.accessibility.AccessibilityManager am =
+                    (android.view.accessibility.AccessibilityManager)
+                            c.getSystemService(Context.ACCESSIBILITY_SERVICE);
+            if (am == null) return false;
+            String me = c.getPackageName() + "/" + ClipWatchService.class.getName();
+            for (android.accessibilityservice.AccessibilityServiceInfo i
+                    : am.getEnabledAccessibilityServiceList(
+                            android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK)) {
+                if (i == null || i.getResolveInfo() == null
+                        || i.getResolveInfo().serviceInfo == null) continue;
+                String flat = i.getResolveInfo().serviceInfo.packageName + "/"
+                        + i.getResolveInfo().serviceInfo.name;
+                if (me.equalsIgnoreCase(flat)) return true;
+            }
+        } catch (Throwable ignored) {
         }
+        return false;
     }
 
     @Override

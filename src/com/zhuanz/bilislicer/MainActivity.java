@@ -69,6 +69,7 @@ public class MainActivity extends Activity implements Jobs.Listener {
     private final java.util.HashSet<String> expanded = new java.util.HashSet<>();  // 展开的片库分组
     private boolean scrollTopNext = false;
     private boolean libLoaded = false;
+    private TextView accBanner;      // 无障碍失效时的提示条
     private LinearLayout libHeadView;     // 片库标题行，通知跳转时滚到这里   // 第一次读完片库了没（用来区分「加载中」和「真的没片子」）   // 下一次渲染后回到顶部（刚下完想看到新的）
     private TextView libStat;
     private TextView chipMonitor;
@@ -165,6 +166,7 @@ public class MainActivity extends Activity implements Jobs.Listener {
             ui.postDelayed(clipTick, 500);
         }
         updateAttachChip();
+        refreshAccBanner();
         refreshRuleLine();
         // 后台（比如选集页）期间监听被清空过，回来补一次队列状态
         onQueueChanged(Jobs.pending());
@@ -513,6 +515,17 @@ public class MainActivity extends Activity implements Jobs.Listener {
         chips.addView(chipStop, sg);
         body.addView(chips);
 
+        // ── 无障碍失效提示条：「复制链接没反应」九成是这个，别让它藏在设置里
+        accBanner = tv("", 12, 0xFF7A4A00, false);
+        accBanner.setPadding(dp(10), dp(8), dp(10), dp(9));
+        accBanner.setBackground(round(0xFFFFF3D6, dp(8)));
+        accBanner.setVisibility(View.GONE);
+        accBanner.setOnClickListener(v -> openAccessibilitySettings());
+        LinearLayout.LayoutParams ab = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ab.topMargin = dp(8);
+        body.addView(accBanner, ab);
+
         ruleLine = tv("", 11, GRAY, false);
         ruleLine.setPadding(dp(4), dp(8), 0, 0);
         body.addView(ruleLine);
@@ -705,7 +718,7 @@ public class MainActivity extends Activity implements Jobs.Listener {
             Intent it = new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
             it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(it);
-            toast("在列表里找到「B站切片」并打开");
+            toast("在列表里找到「片匠」并打开");
         } catch (Exception e) {
             toast("打不开无障碍设置，请手动去系统设置里开");
         }
@@ -887,8 +900,9 @@ public class MainActivity extends Activity implements Jobs.Listener {
         final boolean[] totalMode = {prefs.getFloat("totalMb", 0f) > 0};
 
         // ── 无障碍状态：复制链接没反应，十有八九是这里被系统关了
+        // 以「服务真的连着」为准，勾选状态只用来区分「勾了但没跑」和「压根没勾」
         boolean accOn = ClipWatchService.enabledInSettings(this);
-        boolean accLive = ClipWatchService.connected && accOn;
+        boolean accLive = ClipWatchService.connected || accOn;
         TextView accLine = tv(accLive ? "✓ 复制监听已连接"
                         : (accOn ? "⚠ 复制监听未运行（点这里重新开启）"
                                  : "✕ 复制监听未开启（点这里去开启）"),
@@ -1536,6 +1550,24 @@ public class MainActivity extends Activity implements Jobs.Listener {
     private void log(String s) {
         lastLog = s;
         refreshStatus();
+    }
+
+    /** 自动挂载开着、但复制监听没连上时，主界面顶部提示一句 */
+    private void refreshAccBanner() {
+        if (accBanner == null) return;
+        boolean attach = prefs.getBoolean("attach", false);
+        boolean live = ClipWatchService.connected
+                || ClipWatchService.enabledInSettings(this);
+        if (!attach) {
+            accBanner.setVisibility(View.GONE);
+            return;
+        }
+        if (live) {
+            accBanner.setVisibility(View.GONE);
+            return;
+        }
+        accBanner.setText("⚠ 复制监听已关闭（复制链接不会自动处理）· 点这里开启");
+        accBanner.setVisibility(View.VISIBLE);
     }
 
     private void refreshStatus() {
