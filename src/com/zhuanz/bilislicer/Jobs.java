@@ -155,6 +155,16 @@ public class Jobs {
     public static void enqueue(String url, double limit, int parts, boolean force) {
         if (app == null) return;
         synchronized (LOCK) {
+            // 队列里已经有同一条链接、还没开始跑，就不要再排一遍
+            // （复制事件可能重复触发，或者用户连点两下）
+            if (url != null) {
+                for (Job j : QUEUE) {
+                    if (url.equals(j.url)) {
+                        android.util.Log.i("BiliSlicer", "already queued, skip: " + url);
+                        return;
+                    }
+                }
+            }
             QUEUE.add(new Job(url, limit, parts, force));
             // 线程可能已经异常退出但引用还在，这种情况必须重启，否则任务永远排着不动
             if (worker == null || !worker.isAlive()) {

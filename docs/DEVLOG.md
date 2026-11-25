@@ -1391,3 +1391,53 @@ $ adb shell settings get secure accessibility_enabled
 |---|---|
 | 正常关键帧（60 秒，每 1 秒一个）计划 3 段 | `n=3 cuts=[20s, 40s]` → 三段各 500 帧（20 秒）✓ |
 | 稀疏关键帧（54 秒，只有 0s 和 53.5s）计划 3 段 | `切点调整：3 段 -> 1 段` → 输出完整 54 秒文件 ✓ |
+
+## v6.10 把整条链路真跑了一遍（结论：代码是通的，卡在权限）
+
+上一版判断「无障碍没开」是对的，这版用 adb 直接把权限打开做了端到端验证。
+
+### 打开之后服务立刻连上
+
+```
+$ adb shell settings put secure enabled_accessibility_services \
+    com.zhuanz.bilislicer/com.zhuanz.bilislicer.ClipWatchService
+$ adb shell settings put secure accessibility_enabled 1
+
+# 3 秒后
+I BiliSlicer: ClipWatchService connected
+dumpsys accessibility → Service[label=片匠, eventTypes=[TYPE_VIEW_CLICKED, ...]]
+```
+
+### 在浏览器里点「复制」，链路完整走通
+
+把 app 切到后台，在浏览器地址栏长按 → 复制，日志：
+
+```
+I BiliSlicer: copy click -> read(after 450ms)     ← 无障碍收到点击
+I BiliSlicer: panel shown                          ← 探针窗口读到链接并弹面板
+```
+
+也就是说：复制点击 → 抢焦点读剪贴板 → 解析 → 弹面板，每一环都正常。
+
+### 再确认一次后台轮询是死路
+
+```
+I BiliSlicer: poll: no clip (cm=true)
+```
+
+`hasPrimaryClip()` 在后台一律 false（Android 10+ 限制，无障碍服务也不例外）。
+所以别再指望「后台定时读剪贴板」兜底，后台复制只能靠无障碍点击。
+
+### 补一个队列去重
+
+`Jobs.enqueue` 现在会检查队列里有没有同一条链接（还没开始跑的），
+避免复制事件重复触发或用户连点导致同一条视频排两遍。
+
+### 关键结论
+
+代码链路没问题；「复制了没反应」的原因是**无障碍授权被系统撤销**。
+MIUI 在应用更新后会自动撤销无障碍授权 —— 也就是说每装一次新包，
+都要回去把「片匠」的无障碍开关重新打开一次。
+
+设置页顶部那行状态就是为此加的：正常显示「✓ 复制监听已连接」，
+被撤销时显示「✕ 复制监听未开启（点这里去开启）」，点一下直达系统设置。
