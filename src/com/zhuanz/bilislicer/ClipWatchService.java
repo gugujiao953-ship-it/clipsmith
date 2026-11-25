@@ -16,9 +16,26 @@ public class ClipWatchService extends AccessibilityService {
 
     private static final String TAG = "BiliSlicer";
 
+    /** 服务是否连着。国产 ROM 会随时关掉它，界面靠这个状态提示用户 */
+    public static volatile boolean connected = false;
+
+    /** 系统里这个无障碍服务是否仍被勾选 */
+    public static boolean enabledInSettings(Context c) {
+        try {
+            String key = c.getPackageName() + "/" + ClipWatchService.class.getName();
+            String flat = android.provider.Settings.Secure.getString(
+                    c.getContentResolver(),
+                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            return flat != null && flat.toLowerCase().contains(key.toLowerCase());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+        connected = true;
         Log.i(TAG, "ClipWatchService connected");
         ClipService.wake(this);
     }
@@ -55,5 +72,12 @@ public class ClipWatchService extends AccessibilityService {
 
     @Override
     public void onInterrupt() {
+        connected = false;
+    }
+
+    @Override
+    public boolean onUnbind(android.content.Intent intent) {
+        connected = false;
+        return super.onUnbind(intent);
     }
 }

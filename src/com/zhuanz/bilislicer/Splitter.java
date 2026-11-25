@@ -263,6 +263,9 @@ public class Splitter {
             }
             n = realN;
 
+            Log.i("BiliSlicer", "split n=" + n + " plan=" + plan0 + " durUs=" + durUs
+                    + " syncs=" + syncs.size() + " step=" + stepUs + " tol=" + tol
+                    + " cuts=" + cutUs);
             Result r = new Result();
             r.parts = n;
             r.planned = plan0;

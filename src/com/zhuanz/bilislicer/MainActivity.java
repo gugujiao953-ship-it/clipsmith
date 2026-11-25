@@ -886,6 +886,29 @@ public class MainActivity extends Activity implements Jobs.Listener {
         // 当前模式：填了整片目标大小 = 「整条一个文件」
         final boolean[] totalMode = {prefs.getFloat("totalMb", 0f) > 0};
 
+        // ── 无障碍状态：复制链接没反应，十有八九是这里被系统关了
+        boolean accOn = ClipWatchService.enabledInSettings(this);
+        boolean accLive = ClipWatchService.connected && accOn;
+        TextView accLine = tv(accLive ? "✓ 复制监听已连接"
+                        : (accOn ? "⚠ 复制监听未运行（点这里重新开启）"
+                                 : "✕ 复制监听未开启（点这里去开启）"),
+                12, accLive ? SUB : PINK, true);
+        accLine.setPadding(0, dp(4), 0, dp(6));
+        accLine.setOnClickListener(v -> {
+            if (accLive) {
+                toast("已连接，在抖音/快手/B站点「复制链接」就会自动处理");
+                return;
+            }
+            try {
+                startActivity(new Intent(
+                        android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                toast("找到「片匠」打开开关，回来即可生效");
+            } catch (Exception e) {
+                toast("打不开系统设置，请手动去无障碍里开启");
+            }
+        });
+        box.addView(accLine);
+
         // ── 分组标题
         box.addView(tv("分片方式", 12, PINK, true), lpTop(4));
         box.addView(tv("两种模式二选一，其余参数会自动忽略", 11, GRAY, false), lpTop(2));

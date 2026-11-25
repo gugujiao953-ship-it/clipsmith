@@ -46,6 +46,7 @@ public class ClipService extends Service {
     private View bubble;          // 常驻小悬浮球：点一下就读剪贴板
     private boolean bubbleShown;
     private String lastSig = "";
+    private long lastSigAt = 0;   // 上次记录签名的时间（去重窗口用）
     private boolean loggedDenied;
     public static volatile ClipService instance;
     /** 本应用任意界面是否在前台（主界面/选集/记录） */
@@ -243,6 +244,21 @@ public class ClipService extends Service {
         probeAt = System.currentTimeMillis();
     }
 
+    /**
+     * 剪贴板去重。不能只比「链接 + 时间戳」：
+     * 小米等 ROM 重新复制同一段文字时剪贴板时间戳不会变，
+     * 只比 sig 会让同一条链接永久跳过，看起来就是「复制了没反应」。
+     * 所以只在 30 秒窗口内算重复。
+     */
+    private boolean isDuplicate(String sig) {
+        return sig.equals(lastSig) && System.currentTimeMillis() - lastSigAt < 30_000L;
+    }
+
+    private void rememberSig(String sig) {
+        lastSig = sig;
+        lastSigAt = System.currentTimeMillis();
+    }
+
     /** 探针 Activity 读到链接后回调这里 */
     public void onUrlFound(String url) {
         if (url == null || url.isEmpty()) return;
@@ -255,11 +271,11 @@ public class ClipService extends Service {
         } catch (Exception ignored) {
         }
         String sig = url + "#" + ts;
-        if (sig.equals(lastSig)) {
-            Log.i(TAG, "same clip, skip: " + url);
+        if (isDuplicate(sig)) {
+            Log.i(TAG, "same clip within 30s, skip: " + url);
             return;
         }
-        lastSig = sig;
+        rememberSig(sig);
         Log.i(TAG, "resolve for " + url);
         resolveThenPanel(url);
     }
@@ -326,16 +342,25 @@ public class ClipService extends Service {
     }
 
     private void poll() {
-        if (!getSharedPreferences("bili", MODE_PRIVATE).getBoolean("attach", false)) return;
+        boolean attach = getSharedPreferences("bili", MODE_PRIVATE).getBoolean("attach", false);
+        if (!attach) return;
         if (cm == null) cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        if (cm == null || !cm.hasPrimaryClip()) return;
+        boolean has = cm != null && cm.hasPrimaryClip();
+        if (!has) {
+            android.util.Log.i(TAG, "poll: no clip (cm=" + (cm != null) + ")");
+            return;
+        }
         ClipData cd = cm.getPrimaryClip();
         if (cd == null || cd.getItemCount() == 0) return;
         CharSequence cs = cd.getItemAt(0).coerceToText(this);
         if (cs == null) return;
 
         String url = MainActivity.firstBiliUrlStatic(cs.toString());
-        if (url == null) return;
+        if (url == null) {
+            String t = cs.toString();
+            android.util.Log.i(TAG, "poll: text without url [" + (t.length() > 40 ? t.substring(0, 40) : t) + "]");
+            return;
+        }
         if (url.equals(getSharedPreferences("bili", MODE_PRIVATE).getString("selfCopiedUrl", null))) {
             getSharedPreferences("bili", MODE_PRIVATE).edit().remove("selfCopiedUrl").apply();
             return;
@@ -345,8 +370,8 @@ public class ClipService extends Service {
         ClipDescription desc = cm.getPrimaryClipDescription();
         if (desc != null) ts = desc.getTimestamp();
         String sig = url + "#" + ts;
-        if (sig.equals(lastSig)) return;
-        lastSig = sig;
+        if (isDuplicate(sig)) return;
+        rememberSig(sig);
 
         Log.i(TAG, "clip hit: " + url);
         if (MainActivity.foreground) {
