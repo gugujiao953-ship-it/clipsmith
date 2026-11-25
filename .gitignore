@@ -1,0 +1,23 @@
+# 构建产物
+build/
+*.apk
+*.apk.idsig
+*.dex
+
+# 签名密钥（绝对不要提交）
+*.jks
+*.keystore
+debug.jks
+
+# 输出片段
+out/
+
+# 编辑器 / 系统
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Python 临时
+__pycache__/
+*.pyc

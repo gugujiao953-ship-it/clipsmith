@@ -1,0 +1,250 @@
+package com.zhuanz.bilislicer;
+
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.media.MediaMuxer;
+import android.util.Log;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.TreeMap;
+
+/**
+ * 按「字节数」均衡切分，切点吸附到视频关键帧，只做重封装不重编码。
+ * 按时长切会因为码率不均导致某段 11MB、某段 7MB；按字节切才能每段都贴着上限。
+ */
+public class Splitter {
+
+    public interface Progress {
+        void onProgress(int part, int total);
+    }
+
+    public static class Result {
+        public List<File> files = new ArrayList<>();
+        public int parts;
+    }
+
+    /** 用一帧一帧的样本大小累加，不做解码，很快 */
+    static long[] cumBySecond(File f) throws IOException {
+        MediaExtractor ex = new MediaExtractor();
+        ex.setDataSource(f.getAbsolutePath());
+        for (int i = 0; i < ex.getTrackCount(); i++) {
+            try { ex.selectTrack(i); } catch (Exception ignored) { }
+        }
+        TreeMap<Long, Long> perSec = new TreeMap<>();
+        while (true) {
+            // 注意：抖音视频首帧常是负时间戳（-46ms 之类），负数不代表没有样本。
+            // 判断「还有没有样本」要用 getSampleTrackIndex()。
+            if (ex.getSampleTrackIndex() < 0) break;
+            long t = ex.getSampleTime();
+            long sz = ex.getSampleSize();
+            long sec = Math.max(0, t / 1_000_000L);
+            Long old = perSec.get(sec);
+            perSec.put(sec, (old == null ? 0 : old) + Math.max(0, sz));
+            if (!ex.advance()) break;
+        }
+        ex.release();
+
+        long maxSec = perSec.isEmpty() ? 0 : perSec.lastKey();
+        long[] cum = new long[(int) maxSec + 2];
+        long acc = 0;
+        for (int s = 0; s <= maxSec; s++) {
+            Long v = perSec.get((long) s);
+            acc += (v == null ? 0 : v);
+            cum[s] = acc;
+        }
+        cum[(int) maxSec + 1] = acc;
+        return cum;
+    }
+
+    /** 视频关键帧时间点（微秒） */
+    static List<Long> syncTimes(File f) throws IOException {
+        MediaExtractor ex = new MediaExtractor();
+        ex.setDataSource(f.getAbsolutePath());
+        int v = -1;
+        for (int i = 0; i < ex.getTrackCount(); i++) {
+            String m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+            if (m != null && m.startsWith("video/")) { v = i; break; }
+        }
+        List<Long> out = new ArrayList<>();
+        if (v >= 0) {
+            ex.selectTrack(v);
+            while (true) {
+                long t = ex.getSampleTime();
+                if (t < 0) break;
+                if ((ex.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0) out.add(t);
+                if (!ex.advance()) break;
+            }
+        }
+        ex.release();
+        return out;
+    }
+
+    /** 读整片时长（微秒） */
+    static long durationUsOf(File f) {
+        android.media.MediaMetadataRetriever r = new android.media.MediaMetadataRetriever();
+        try {
+            r.setDataSource(f.getAbsolutePath());
+            String d = r.extractMetadata(
+                    android.media.MediaMetadataRetriever.METADATA_KEY_DURATION);
+            return d == null ? 0 : Long.parseLong(d) * 1000L;
+        } catch (Exception e) {
+            return 0;
+        } finally {
+            try {
+                r.release();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public static Result split(File in, File outDir, String base, double partBytes,
+                               Progress cb) throws Exception {
+        return split(in, outDir, base, partBytes, 0, cb);
+    }
+
+    /**
+     * @param partUs 每段目标时长（微秒）；>0 时按时长切，忽略 partBytes
+     */
+    public static Result split(File in, File outDir, String base, double partBytes,
+                               long partUs, Progress cb) throws Exception {
+        return split(in, outDir, base, partBytes, partUs, 0, 0, cb);
+    }
+
+    /**
+     * @param startUs 从这里开始（去掉开头），0 = 从头
+     * @param endUs   到这里结束（去掉结尾），0 = 到片尾
+     */
+    public static Result split(File in, File outDir, String base, double partBytes,
+                               long partUs, long startUs, long endUs,
+                               Progress cb) throws Exception {
+        // 只需要总字节数：以前为了「按字节找切点」遍历了全文件所有样本，
+        // 现在切点按时间均分，直接取文件长度，省掉一次整文件扫描
+        long total = in.length();
+        if (total <= 0) throw new IOException("读取文件大小失败");
+
+        long fullUs = durationUsOf(in);
+        if (fullUs <= 0) throw new IOException("读不到视频时长，无法切分");
+        // 支持裁掉开头 / 结尾：算段数时只用有效时长
+        long durUs = fullUs;
+        if (startUs > 0 && startUs < durUs) durUs -= startUs;
+        if (endUs > 0 && endUs < fullUs) durUs = endUs - (startUs > 0 ? startUs : 0);
+
+        // 两个限制同时生效：谁先到就按谁切。
+        // 以前 partUs>0 就完全忽略体积，4 分钟一到就切，
+        // 于是 4 分半钟的视频被切成 28MB + 2MB。
+        int nBytes = partBytes > 0 ? (int) Math.ceil(total / partBytes) : 1;
+        int nTime = (partUs > 0 && durUs > 0) ? (int) Math.ceil((double) durUs / partUs) : 1;
+        int n = Math.max(1, Math.max(nBytes, nTime));
+
+        List<Long> syncs = syncTimes(in);
+        {
+            // 切点 = 平均分段的边界，再吸附到关键帧
+            long stepUs = durUs / n;
+            List<Long> cutUs = new ArrayList<>();
+            for (int k = 1; k < n; k++) {
+                long targetUs = startUs + stepUs * k;
+                long best = targetUs;
+                long bestDiff = Long.MAX_VALUE;
+                for (long sy : syncs) {
+                    long d = Math.abs(sy - targetUs);
+                    if (d < bestDiff) {
+                        bestDiff = d;
+                        best = sy;
+                    }
+                }
+                if (!cutUs.isEmpty() && best <= cutUs.get(cutUs.size() - 1)) {
+                    best = cutUs.get(cutUs.size() - 1) + 1_000_000L;
+                }
+                cutUs.add(best);
+            }
+            Result r = new Result();
+            r.parts = n;
+            long[] bounds = new long[n + 1];
+            bounds[0] = Math.max(0, startUs);
+            for (int i = 0; i < cutUs.size(); i++) bounds[i + 1] = cutUs.get(i);
+            bounds[n] = (endUs > 0 && endUs < fullUs) ? endUs : Long.MAX_VALUE;
+            for (int i = 0; i < n; i++) {
+                String name = n == 1 ? base + ".mp4"
+                        : String.format("%02d_%s_%dof%d.mp4", i + 1, base, i + 1, n);
+                File out = new File(outDir, name);
+                extractRange(in, out, bounds[i], bounds[i + 1]);
+                if (out.length() <= 0) {
+                    throw new IOException("片段 " + name + " 切出来是空的（关键帧定位失败）");
+                }
+                r.files.add(out);
+                if (cb != null) cb.onProgress(i + 1, n);
+            }
+            return r;
+        }
+    }
+
+    /** 把 [startUs, endUs) 区间内的样本原样搬到新文件 */
+    static void extractRange(File in, File out, long startUs, long endUs) throws IOException {
+        MediaExtractor ex = new MediaExtractor();
+        ex.setDataSource(in.getAbsolutePath());
+
+        MediaMuxer mux = new MediaMuxer(out.getAbsolutePath(),
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        int[] trackMap = new int[ex.getTrackCount()];
+        java.util.Arrays.fill(trackMap, -1);
+        boolean started = false;
+        long offset = startUs;   // 配合 shift 使用
+        long samples = 0;
+
+        try {
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                try { trackMap[i] = mux.addTrack(ex.getTrackFormat(i)); }
+                catch (Exception ignored) { trackMap[i] = -1; }
+            }
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                try { ex.selectTrack(i); } catch (Exception ignored) { }
+            }
+            ex.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+
+            // 首帧可能是负数（B 帧 / edit list 偏移），整体平移，保证输出从 0 开始
+            long firstT = ex.getSampleTime();
+            long shift = firstT < 0 ? -firstT : 0;
+            long wrote = 0;
+            ByteBuffer buf = ByteBuffer.allocateDirect(4 * 1024 * 1024);
+            MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
+            while (true) {
+                if (ex.getSampleTrackIndex() < 0) break;
+                long t = ex.getSampleTime();
+                if (t >= endUs) break;
+
+                int from = ex.getSampleTrackIndex();
+                if (from < 0) { ex.advance(); continue; }
+                int sz = ex.readSampleData(buf, 0);
+                if (sz <= 0) { ex.advance(); continue; }
+                if (t < startUs) { ex.advance(); continue; }
+
+                int to = trackMap[from];
+                if (to < 0) { ex.advance(); continue; }
+
+                if (!started) {
+                    mux.start();
+                    started = true;
+                }
+                bi.offset = 0;
+                bi.size = sz;
+                bi.presentationTimeUs = Math.max(0, t - offset);
+                bi.flags = ex.getSampleFlags();
+                mux.writeSampleData(to, buf, bi);
+                wrote++;
+                samples++;
+                ex.advance();
+            }
+        } finally {
+            Log.i("BiliSlicer", "  part " + out.getName() + " samples=" + samples
+                    + " size=" + out.length());
+            try { ex.release(); } catch (Exception ignored) { }
+            if (started) { try { mux.stop(); } catch (Exception ignored) { } }
+            try { mux.release(); } catch (Exception ignored) { }
+        }
+    }
+}
