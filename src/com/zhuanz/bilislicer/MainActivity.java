@@ -991,6 +991,15 @@ public class MainActivity extends Activity implements Jobs.Listener {
         TextView reset = tv("恢复默认设置", 12, BLUE, true);
         reset.setPadding(0, dp(18), 0, dp(4));
         box.addView(reset);
+        TextView cleanDirs = tv("清理空文件夹", 12, BLUE, true);
+        cleanDirs.setPadding(0, dp(10), 0, dp(4));
+        cleanDirs.setOnClickListener(v -> {
+            int n = Store.purgeEmptyDirs(this);
+            toast(n > 0 ? ("已清理 " + n + " 个空文件夹") : "没有空文件夹");
+            reloadLibrary();
+        });
+        box.addView(cleanDirs);
+
         TextView clearThumb = tv("清空封面缓存", 12, BLUE, true);
         clearThumb.setPadding(0, dp(10), 0, dp(4));
         clearThumb.setOnClickListener(v -> {
@@ -2305,9 +2314,23 @@ public class MainActivity extends Activity implements Jobs.Listener {
                     try (java.io.InputStream in = getContentResolver().openInputStream(it.uri);
                          java.io.OutputStream out = new java.io.FileOutputStream(dest)) {
                         if (in == null) throw new Exception("读不到文件");
-                        byte[] buf = new byte[1 << 16];
-                        int n;
-                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                        // 走通道传输，别再 64KB 一趟趟搬
+                        java.nio.channels.WritableByteChannel oc =
+                                java.nio.channels.Channels.newChannel(out);
+                        if (in instanceof java.io.FileInputStream) {
+                            java.nio.channels.FileChannel ic =
+                                    ((java.io.FileInputStream) in).getChannel();
+                            long total = ic.size(), done = 0;
+                            while (done < total) {
+                                long n = ic.transferTo(done, total - done, oc);
+                                if (n <= 0) break;
+                                done += n;
+                            }
+                        } else {
+                            byte[] buf = new byte[1 << 20];
+                            int n;
+                            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                        }
                     }
                 }
                 Uri shareUri = VideoProvider.uriFor(dest);
@@ -2506,6 +2529,7 @@ public class MainActivity extends Activity implements Jobs.Listener {
                 .setNegativeButton("取消", null)
                 .setPositiveButton("删除", (d, w) -> {
                     if (Library.delete(this, it)) {
+                        Store.dropIfEmpty(it.relPath);   // 删空了就把文件夹一起收掉
                         toast("已删除");
                         reloadLibrary();
                     } else {

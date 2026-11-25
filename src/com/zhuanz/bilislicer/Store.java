@@ -57,6 +57,40 @@ public class Store {
      * 按「整个文件夹」清，是因为文件夹就是这条视频的归属；
      * 只按文件名匹配的话，用户改过名之后就匹配不到了。
      */
+    /** 删掉「B站切片」下已经空了的子文件夹（只删空目录，绝不碰有内容的） */
+    public static int purgeEmptyDirs(Context ctx) {
+        int n = 0;
+        try {
+            File root = new File(
+                    android.os.Environment.getExternalStorageDirectory(),
+                    "Download/B站切片");
+            File[] kids = root.listFiles();
+            if (kids == null) return 0;
+            for (File d : kids) {
+                if (!d.isDirectory()) continue;
+                String[] inner = d.list();
+                if (inner != null && inner.length == 0 && d.delete()) n++;
+            }
+        } catch (Exception ignored) {
+        }
+        return n;
+    }
+
+    /** 某个子目录空了就顺手删掉（单个删除、清旧片段之后调用） */
+    public static void dropIfEmpty(String subDir) {
+        if (subDir == null || subDir.isEmpty()) return;
+        try {
+            String rel = subDir.startsWith("Download/") ? subDir : ("Download/B站切片/" + subDir);
+            File d = new File(android.os.Environment.getExternalStorageDirectory(), rel);
+            String[] inner = d.list();
+            if (d.isDirectory() && inner != null && inner.length == 0) {
+                //noinspection ResultOfMethodCallIgnored
+                d.delete();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
     public static int clearExisting(Context ctx, String subDir) {
         ContentResolver cr = ctx.getContentResolver();
         String rel = Environment.DIRECTORY_DOWNLOADS + "/B站切片/" + subDir + "/";

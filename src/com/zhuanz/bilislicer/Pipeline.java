@@ -233,6 +233,45 @@ public class Pipeline {
     }
 
     /** 从文件里读真实时长（各平台都给不准，直接读最稳） */
+    /** 有没有音轨 */
+    static boolean hasAudio(File f) {
+        android.media.MediaExtractor ex = new android.media.MediaExtractor();
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                String m = ex.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME);
+                if (m != null && m.startsWith("audio/")) return true;
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                ex.release();
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
+    /** 读源文件的视频编码，用来判断「不重编码直接切」是否安全 */
+    static String videoMimeOf(File f) {
+        android.media.MediaExtractor ex = new android.media.MediaExtractor();
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                android.media.MediaFormat mf = ex.getTrackFormat(i);
+                String m = mf.getString(android.media.MediaFormat.KEY_MIME);
+                if (m != null && m.startsWith("video/")) return m;
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                ex.release();
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
     static long durationOf(File f) {
         long us = durationUsOf(f);
         return us > 0 ? us / 1000 : 0;
@@ -546,10 +585,20 @@ public class Pipeline {
                 } catch (Exception e) {
                     encoded = false;
                     android.util.Log.w("BiliSlicer", "transcode fail", e);
+                    String srcMime = videoMimeOf(raw);
+                    if (srcMime != null && !srcMime.equals("video/avc")) {
+                        // 源是 HEVC/AV1 之类：直接切出来的段微信和相册很可能播不了，
+                        // 与其产出坏文件，不如明确报错
+                        throw new Exception("转码失败（" + e.getMessage() + "），且源视频是 "
+                                + srcMime + "，直接切分可能无法在微信里播放");
+                    }
                     log.line("   ⚠ 转码失败：" + e.getMessage() + "，改为直接切原片");
                 }
                 // 如果预裁剪成功，enc 里已经不含片头片尾了，切分时别再裁一次
                 final boolean preTrimmed = !encodeSrc.equals(raw);
+                if (encoded && hasAudio(raw) && !hasAudio(enc)) {
+                    log.line("   ⚠ 源音轨 MP4 装不下（如 opus），这一版成品没有声音");
+                }
                 File toSplit = encoded ? enc : encodeSrc;
                 long splitStart = preTrimmed ? 0 : startUs;
                 long splitEnd = preTrimmed ? 0 : endUs;

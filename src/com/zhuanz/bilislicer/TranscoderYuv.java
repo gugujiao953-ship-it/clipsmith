@@ -183,7 +183,22 @@ public class TranscoderYuv {
                     if (vInfo.size > 0) {
                         if (!muxStarted) {
                             vTrack = mux.addTrack(enc.getOutputFormat());
-                            if (aIdx >= 0) aTrack = mux.addTrack(ex.getTrackFormat(aIdx));
+                            if (aIdx >= 0) {
+                                // 音轨是 opus / flac / ac3 这类时，MP4 容器可能直接拒收，
+                                // 以前会让整单失败 —— 现在退化成无声视频，至少能用
+                                try {
+                                    android.media.MediaFormat af = ex.getTrackFormat(aIdx);
+                                    String am = af.getString(android.media.MediaFormat.KEY_MIME);
+                                    if (am != null && !am.equals("audio/mp4a-latm")) {
+                                        Log.i(TAG, "audio mime unsupported for mp4: " + am);
+                                    }
+                                    aTrack = mux.addTrack(af);
+                                } catch (Exception e) {
+                                    android.util.Log.w(TAG, "audio track rejected, mute output", e);
+                                    aTrack = -1;
+                                    aIdx = -1;
+                                }
+                            }
                             // 解码出来的帧是「未旋转」的，旋转信息交给播放器去转
                             try {
                                 if (rot != 0) mux.setOrientationHint(rot);
