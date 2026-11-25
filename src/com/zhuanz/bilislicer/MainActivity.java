@@ -2150,7 +2150,8 @@ public class MainActivity extends Activity implements Jobs.Listener {
         line.setOrientation(LinearLayout.HORIZONTAL);
         line.setGravity(Gravity.CENTER_VERTICAL);
         line.setPadding(0, dp(5), 0, 0);
-        line.addView(tv(Library.mb(it.size), 11, GRAY, false),
+        line.addView(tv(Library.mb(it.size) + (it.durMs > 0 ? " · " + fmtClock(it.durMs) : ""),
+                        11, GRAY, false),
                 new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         TextView wx = chip("微信", WECHAT, Color.WHITE, 11);
@@ -2189,7 +2190,9 @@ public class MainActivity extends Activity implements Jobs.Listener {
         line.setOrientation(LinearLayout.HORIZONTAL);
         line.setGravity(Gravity.CENTER_VERTICAL);
         line.setPadding(0, dp(4), 0, 0);
-        TextView sz = tv(Library.mb(it.size), 10.5f, GRAY, false);
+        // 单段行也把时长带上，挑片段时不用点进去
+        TextView sz = tv(Library.mb(it.size) + (it.durMs > 0 ? " · " + fmtClock(it.durMs) : ""),
+                10.5f, GRAY, false);
         sz.setMaxLines(1);
         line.addView(sz, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));

@@ -29,7 +29,7 @@ import java.util.concurrent.Executors;
  */
 public class Thumbs {
 
-    private static final String VER = "v3_";
+    private static final String VER = "v5_";   // v5: 暗帧提亮 + 短视频取中间帧
     private static final int SRC_W = 480;
 
     private static final LruCache<String, Bitmap> MEM = new LruCache<String, Bitmap>(
@@ -181,7 +181,10 @@ public class Thumbs {
             long[] seeks = durMs > 2000
                     ? new long[]{(long) (durMs * 0.12), (long) (durMs * 0.35),
                                  (long) (durMs * 0.60), 0}
-                    : new long[]{0};
+                    : durMs > 100
+                      // 短视频常常是黑场淡入，第 0 帧全黑，补一个中间帧
+                      ? new long[]{(long) (durMs * 0.5), 0}
+                      : new long[]{0};
             for (long ms : seeks) {
                 Bitmap fr = r.getFrameAtTime(ms * 1000,
                         MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
@@ -202,6 +205,12 @@ public class Thumbs {
         }
         if (b == null) return null;
 
+        // 四个候选时间点都是暗帧（夜景、室内暗光）时缩略图看起来像加载失败，
+        // 这里做一次提亮 + 轻微对比拉伸，至少能看清画面轮廓
+        if (isDark(b)) {
+            b = brighten(b);
+        }
+
         if (b.getWidth() > SRC_W) {
             int h = Math.max(1, b.getHeight() * SRC_W / b.getWidth());
             Bitmap small = Bitmap.createScaledBitmap(b, SRC_W, h, true);
@@ -214,6 +223,30 @@ public class Thumbs {
     }
 
     /** 平均亮度低于阈值就当黑屏 */
+    /** 整体偏暗时提亮：亮度线性放大 + 少量对比，缩略图尺寸下噪点看不出来 */
+    static Bitmap brighten(Bitmap src) {
+        try {
+            int w = src.getWidth(), h = src.getHeight();
+            Bitmap out = Bitmap.createBitmap(w, h,
+                    src.getConfig() != null ? src.getConfig() : Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas cv = new android.graphics.Canvas(out);
+            android.graphics.Paint p = new android.graphics.Paint();
+            // 亮度 ×1.9，再减 12 抬黑位（让死黑区域浮出细节）
+            android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix(new float[]{
+                    1.9f, 0, 0, 0, -12,
+                    0, 1.9f, 0, 0, -12,
+                    0, 0, 1.9f, 0, -12,
+                    0, 0, 0, 1, 0
+            });
+            p.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
+            cv.drawBitmap(src, 0, 0, p);
+            if (out != src) src.recycle();
+            return out;
+        } catch (Throwable t) {
+            return src;
+        }
+    }
+
     static boolean isDark(Bitmap b) {
         try {
             int w = 32, h = Math.max(1, b.getHeight() * 32 / Math.max(1, b.getWidth()));
@@ -228,7 +261,7 @@ public class Thumbs {
                 }
             }
             if (s != b) s.recycle();
-            return n == 0 || sum / n < 24;
+            return n == 0 || sum / n < 45;
         } catch (Throwable t) {
             return false;
         }
