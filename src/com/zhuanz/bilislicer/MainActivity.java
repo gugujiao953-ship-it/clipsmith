@@ -1629,7 +1629,13 @@ public class MainActivity extends Activity implements Jobs.Listener {
 
     @Override
     public void onFinished(String error) {
-        if (error == null) scrollTopNext = true;    // 下载完成：回到顶部看新视频
+        if (error == null) {
+            scrollTopNext = true;    // 下载完成：回到顶部看新视频
+            // 成功一次就把上次的失败痕迹清掉，别让「重试」一直挂着旧链接
+            Jobs.lastFailedUrl = null;
+            prefs.edit().remove("lastFailUrl").remove("clipFailSig").apply();
+            if (chipRetry != null) chipRetry.setVisibility(View.GONE);
+        }
         if (error != null) {
             toast(error);
             String failed = Jobs.lastFailedUrl;
@@ -2600,6 +2606,7 @@ public class MainActivity extends Activity implements Jobs.Listener {
                                 .setNegativeButton("取消", null)
                                 .setPositiveButton("删除整组", (dd, w) -> {
                                     for (Library.Item it : g.items) Library.delete(this, it);
+                                    Store.dropIfEmpty(g.relPath);   // 删空了顺手把文件夹收掉
                                     reloadLibrary();
                                 })
                                 .show();
