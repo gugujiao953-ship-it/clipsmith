@@ -301,10 +301,13 @@ public class Pipeline {
             int maxKbps = sp.getInt("maxKbps", 900);        // 码率上限，0 = 不限
 
             log.line("① 解析链接…");
+            Diag.line("解析", "请求 " + url);
             Source.Media media = Source.resolve(ctx, url, hq);
             // 多分P 的标题带上 P 号，否则记录里几条一模一样分不清
             res.title = media.pageCount > 1
                     ? (media.title + " · P" + media.page) : media.title;
+            Diag.line("解析成功", media.platform + " id=" + media.id
+                    + " 分P=" + (media.page + "/" + media.pageCount) + " 《" + media.title + "》");
             res.key = media.id;
             res.platform = media.platform;
             android.util.Log.i("BiliSlicer", "resolved id=" + media.id + " page=" + media.page
@@ -430,6 +433,7 @@ public class Pipeline {
                          Log log, Progress prog) throws Exception {
             long rawSize = raw.length();
             long durMs = durationOf(raw);
+            Diag.line("素材就绪", "原片 " + Library.mb(rawSize) + "，时长 " + (durMs / 1000) + "s");
             log.line("   已下载 " + Library.mb(rawSize));
             if (rawSize < 10000) throw new Exception("下载到的文件异常（可能链接失效）");
 
@@ -573,6 +577,8 @@ public class Pipeline {
 
                 File enc = new File(work, "enc.mp4");
                 boolean encoded = true;
+                final long encT0 = System.currentTimeMillis();
+                Diag.line("开始转码", "目标 " + videoKbps + "k 宽" + (needCompress4Total ? targetWidth : 854));
                 try {
                     Transcoder.transcode(encodeSrc, enc, videoKbps * 1000,
                             needCompress4Total ? targetWidth : 854, 1,
@@ -592,6 +598,7 @@ public class Pipeline {
                         throw new Exception("转码失败（" + e.getMessage() + "），且源视频是 "
                                 + srcMime + "，直接切分可能无法在微信里播放");
                     }
+                    Diag.line("转码失败", e.toString());
                     log.line("   ⚠ 转码失败：" + e.getMessage() + "，改为直接切原片");
                 }
                 // 如果预裁剪成功，enc 里已经不含片头片尾了，切分时别再裁一次
@@ -609,6 +616,8 @@ public class Pipeline {
                             checkCancel();
                             if (prog != null) prog.pct(90 + part * 10 / Math.max(1, total));
                         });
+                Diag.line("切分", "段数 " + r.parts + "（计划 " + r.planned + "），输入 "
+                        + Library.mb(toSplit.length()));
                 if (r.parts != r.planned) {
                     log.line("   关键帧不够密：本来切 " + r.planned + " 段，改成 " + r.parts
                             + " 段（否则会切出几秒的碎片）");
@@ -623,6 +632,7 @@ public class Pipeline {
                 Uri u = Store.saveToDownloads(ctx, f, base, f.getName());
                 res.uris.add(u);
             }
+            Diag.line("落库", outs.size() + " 个文件，清旧 " + cleared + " 个");
             res.parts = outs.size();
             for (File f : outs) res.bytes += f.length();
             log.line("✓ 完成，共 " + outs.size() + " 个文件");

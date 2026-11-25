@@ -47,6 +47,14 @@ public class ClipService extends Service {
     private boolean bubbleShown;
     private String lastSig = "";
     private long lastSigAt = 0;   // 上次记录签名的时间（去重窗口用）
+    private String failedSig = "";  // 解析失败的剪贴板内容：不再自动重试，免得每 30 秒弹一次
+    /** 前台那一路失败时也会调这个，让后台一起闭嘴 */
+    private static volatile String failedSigShared = "";
+
+    public static void noteClipFailed(String sig) {
+        if (sig != null && !sig.isEmpty()) failedSigShared = sig;
+    }
+    private String curSig = "";     // 正在解析的那条
     private boolean loggedDenied;
     public static volatile ClipService instance;
     /** 本应用任意界面是否在前台（主界面/选集/记录） */
@@ -251,6 +259,16 @@ public class ClipService extends Service {
      * 所以只在 30 秒窗口内算重复。
      */
     private boolean isDuplicate(String sig) {
+        // 解析失败过的那条，除非剪贴板变了，否则不再自动弹面板
+        if (!failedSig.isEmpty() && sig.equals(failedSig)) return true;
+        if (!failedSigShared.isEmpty() && sig.equals(failedSigShared)) return true;
+        // 前台那一路把失败签名存在 prefs 里，这里也要认，否则后台照样每 30 秒刷一遍
+        try {
+            String saved = getSharedPreferences("bili", MODE_PRIVATE)
+                    .getString("clipFailSig", "");
+            if (saved != null && !saved.isEmpty() && sig.equals(saved)) return true;
+        } catch (Throwable ignored) {
+        }
         return sig.equals(lastSig) && System.currentTimeMillis() - lastSigAt < 30_000L;
     }
 
@@ -276,6 +294,8 @@ public class ClipService extends Service {
             return;
         }
         rememberSig(sig);
+        curSig = sig;
+        Diag.global("检测到链接", "来源=无障碍点击 " + url);
         Log.i(TAG, "resolve for " + url);
         resolveThenPanel(url);
     }
@@ -372,7 +392,9 @@ public class ClipService extends Service {
         String sig = url + "#" + ts;
         if (isDuplicate(sig)) return;
         rememberSig(sig);
+        curSig = sig;
 
+        Diag.global("检测到链接", "来源=后台轮询 " + url);
         Log.i(TAG, "clip hit: " + url);
         if (MainActivity.foreground) {
             // 用户就在我们的界面里，主界面自己会处理
@@ -517,6 +539,8 @@ public class ClipService extends Service {
                 h.post(() -> showOptions(url, m, f1, f2));
             } catch (Exception e) {
                 final String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+                failedSig = curSig;   // 同一条内容不再自动重试
+                Diag.global("解析失败", msg + " （这条不再自动重试，等剪贴板变了再说）");
                 h.post(() -> showInfoPanel("解析失败：" + msg, url, () -> enqueueInBackground(url)));
             }
         }, "clip-resolve").start();

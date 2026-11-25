@@ -166,6 +166,7 @@ public class Jobs {
                 }
             }
             QUEUE.add(new Job(url, limit, parts, force));
+            Diag.global("入队", "队列=" + QUEUE.size() + " " + url);
             // 线程可能已经异常退出但引用还在，这种情况必须重启，否则任务永远排着不动
             if (worker == null || !worker.isAlive()) {
                 worker = new Thread(Jobs::loop, "bili-worker");
@@ -202,6 +203,8 @@ public class Jobs {
                 }
                 notifyQueue();
                 resetCancel();
+                Diag.newJob();
+                Diag.line("开始", (j.url == null ? "本地 " + j.localName : j.url));
                 try {
                     Pipeline.Result r = (j.localUri != null)
                             ? Pipeline.runLocal(app, j.localUri, j.localName,
@@ -238,6 +241,8 @@ public class Jobs {
                     rec.url = j.url;
                     History.add(app, rec);
 
+                    Diag.line("完成", "《" + r.title + "》" + r.parts + " 段 "
+                            + r.bytes / 1024 / 1024 + "MB");
                     WorkService.notifyDone(app, r.title, r.parts);
                     lastFailedUrl = null;
                     final String done = "✓ 《" + r.title + "》完成，" + r.parts + " 个文件";
@@ -271,6 +276,7 @@ public class Jobs {
                     History.addFail(app, j.url, msg);
                     lastFailedUrl = j.url;
                     lastFailedMsg = msg;
+                    Diag.line("失败", msg);
                     logLine("✗ 失败：" + msg);
                     post(() -> {
                         Listener l = listener;

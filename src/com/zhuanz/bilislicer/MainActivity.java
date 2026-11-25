@@ -256,6 +256,8 @@ public class MainActivity extends Activity implements Jobs.Listener {
             // 注意：小米等 ROM 上「重新复制同一段文字」不会更新剪贴板时间戳，
             // 所以不能只比 sig —— 否则同一条链接复制第二遍永远不会再处理。
             // 这里改成「内容相同且发生在 30 秒内」才算重复，过了窗口就当作新的一次复制。
+            // 上次因为这条内容失败过 → 不再自动重试（否则每 30 秒弹一次失败提示）
+            if (sig.equals(prefs.getString("clipFailSig", ""))) return;
             long lastAt = prefs.getLong("lastClipAt", 0);
             boolean same = sig.equals(lastClipSig)
                     && System.currentTimeMillis() - lastAt < 30_000L;
@@ -284,6 +286,7 @@ public class MainActivity extends Activity implements Jobs.Listener {
             input.setText(url);
             android.util.Log.i("BiliSlicer", "clip enqueue " + url);
             android.util.Log.i("BiliSlicer", "clip enqueue " + url);
+            Diag.global("检测到链接", "来源=前台 " + url);
             log("🔗 识别到链接，开始处理");
             enqueueAll(url);
         } catch (Exception ignored) {
@@ -1053,6 +1056,14 @@ public class MainActivity extends Activity implements Jobs.Listener {
         TextView reset = tv("恢复默认设置", 12, BLUE, true);
         reset.setPadding(0, dp(18), 0, dp(4));
         box.addView(reset);
+        TextView diagBtn = tv("复制诊断日志", 12, BLUE, true);
+        diagBtn.setPadding(0, dp(10), 0, dp(4));
+        diagBtn.setOnClickListener(v -> {
+            Diag.copy(this);
+            toast("诊断日志已复制，直接粘给我就行");
+        });
+        box.addView(diagBtn);
+
         TextView cleanDirs = tv("清理空文件夹", 12, BLUE, true);
         cleanDirs.setPadding(0, dp(10), 0, dp(4));
         cleanDirs.setOnClickListener(v -> {
@@ -1622,7 +1633,12 @@ public class MainActivity extends Activity implements Jobs.Listener {
         if (error != null) {
             toast(error);
             String failed = Jobs.lastFailedUrl;
-            if (failed != null) prefs.edit().putString("lastFailUrl", failed).apply();
+            if (failed != null) {
+                prefs.edit().putString("lastFailUrl", failed)
+                        // 记下「这条剪贴板内容失败了」，别自动再试
+                        .putString("clipFailSig", prefs.getString("lastClipSig", "")).apply();
+                ClipService.noteClipFailed(prefs.getString("lastClipSig", ""));
+            }
             if (chipRetry != null && failed != null) {
                 chipRetry.setVisibility(View.VISIBLE);
             }
