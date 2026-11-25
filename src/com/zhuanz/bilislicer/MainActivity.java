@@ -167,6 +167,14 @@ public class MainActivity extends Activity implements Jobs.Listener {
         }
         updateAttachChip();
         refreshAccBanner();
+        // 上次失败的链接存在 prefs 里，重启后重试按钮还在
+        if (chipRetry != null && Jobs.lastFailedUrl == null) {
+            String last = prefs.getString("lastFailUrl", null);
+            if (last != null && !last.isEmpty()) {
+                Jobs.lastFailedUrl = last;
+                chipRetry.setVisibility(View.VISIBLE);
+            }
+        }
         refreshRuleLine();
         // 后台（比如选集页）期间监听被清空过，回来补一次队列状态
         onQueueChanged(Jobs.pending());
@@ -398,7 +406,7 @@ public class MainActivity extends Activity implements Jobs.Listener {
 
         LinearLayout titleBox = new LinearLayout(this);
         titleBox.setOrientation(LinearLayout.VERTICAL);
-        titleBox.addView(tv("B站切片", 20, Color.WHITE, true));
+        titleBox.addView(tv(getString(R.string.app_name), 20, Color.WHITE, true));
         titleBox.addView(tv("B站 · 抖音 · 快手 · 存片库 · 一键发微信", 11, 0xFFFFD9E5, false));
         bar0.addView(titleBox, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
@@ -488,8 +496,12 @@ public class MainActivity extends Activity implements Jobs.Listener {
             }
             input.setText(u);
             Jobs.lastFailedUrl = null;
+            prefs.edit().remove("lastFailUrl").apply();
             chipRetry.setVisibility(View.GONE);
-            start();
+            // 用户明确点了重试，就别再弹「已经处理过」了，直接排进队列
+            java.util.List<String> one = new java.util.ArrayList<>();
+            one.add(u);
+            doEnqueue(one, true);
         });
         LinearLayout.LayoutParams rg = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -1331,7 +1343,10 @@ public class MainActivity extends Activity implements Jobs.Listener {
         for (String u : urls) {
             String k = History.keyOf(u);
             History.Rec r = k.isEmpty() ? null : History.find(this, k);
-            if (r != null) {
+            // 只把「成功切过」的算重复。失败记录也在历史里，
+            // 但失败后重新粘贴/重试本来就该直接再跑一遍 —— 以前不区分，
+            // 结果是：失败了点重试，弹一句「这个视频之前已经切过了」，看着就像没反应。
+            if (r != null && !r.fail) {
                 dupTitles.add(r.title);
             } else {
                 fresh.add(u);
@@ -1606,7 +1621,9 @@ public class MainActivity extends Activity implements Jobs.Listener {
         if (error == null) scrollTopNext = true;    // 下载完成：回到顶部看新视频
         if (error != null) {
             toast(error);
-            if (chipRetry != null && Jobs.lastFailedUrl != null) {
+            String failed = Jobs.lastFailedUrl;
+            if (failed != null) prefs.edit().putString("lastFailUrl", failed).apply();
+            if (chipRetry != null && failed != null) {
                 chipRetry.setVisibility(View.VISIBLE);
             }
         }
