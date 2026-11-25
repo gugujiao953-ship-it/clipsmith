@@ -84,20 +84,90 @@ public class Splitter {
         return out;
     }
 
-    /** 读整片时长（微秒） */
+    /**
+     * 读整片时长（微秒）。三级兜底，任何一级拿到就算：
+     *   1) MediaExtractor 读轨道头里的 duration —— 最稳，也是最快（几毫秒）
+     *   2) MediaMetadataRetriever —— 老办法，对部分容器（碎片 MP4、带 elst 的抖音片）会返回 null
+     *   3) 逐样本扫到结尾取最后一个时间戳 —— 前两级都失败时才做，
+     *      不解码只读包头，几千个样本也就几十毫秒，胜在几乎不可能失败
+     * 以前只用了第 2 级，所以「有些视频总是读不到时长」其实就是它读不出来。
+     */
     static long durationUsOf(File f) {
+        long us = 0;
+        // 1) 轨道头
+        android.media.MediaExtractor ex = new android.media.MediaExtractor();
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                try {
+                    android.media.MediaFormat mf = ex.getTrackFormat(i);
+                    if (mf.containsKey(android.media.MediaFormat.KEY_DURATION)) {
+                        us = Math.max(us, mf.getLong(android.media.MediaFormat.KEY_DURATION));
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            try {
+                ex.release();
+            } catch (Exception ignored) {
+            }
+        }
+        if (us > 0) return us;
+
+        // 2) MediaMetadataRetriever
         android.media.MediaMetadataRetriever r = new android.media.MediaMetadataRetriever();
         try {
             r.setDataSource(f.getAbsolutePath());
             String d = r.extractMetadata(
                     android.media.MediaMetadataRetriever.METADATA_KEY_DURATION);
-            return d == null ? 0 : Long.parseLong(d) * 1000L;
-        } catch (Exception e) {
-            return 0;
+            if (d != null) us = Long.parseLong(d) * 1000L;
+        } catch (Exception ignored) {
         } finally {
             try {
                 r.release();
             } catch (Exception ignored) {
+            }
+        }
+        if (us > 0) return us;
+
+        // 3) 扫样本
+        return durationByScan(f);
+    }
+
+    /** 逐样本推进到结尾，用最后一个时间戳当总时长（不解码，只读包头） */
+    static long durationByScan(File f) {
+        android.media.MediaExtractor ex = new android.media.MediaExtractor();
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            int v = -1;
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                try {
+                    String mime = ex.getTrackFormat(i).getString(
+                            android.media.MediaFormat.KEY_MIME);
+                    if (mime != null && mime.startsWith("video/")) {
+                        v = i;
+                        break;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            if (v < 0) return 0;
+            ex.selectTrack(v);
+            long last = 0;
+            int guard = 0;
+            while (guard++ < 2_000_000 && ex.advance()) {
+                long t = ex.getSampleTime();
+                if (t > last) last = t;
+            }
+            return last > 0 ? last : 0;
+        } catch (Throwable t) {
+            return 0;
+        } finally {
+            try {
+                ex.release();
+            } catch (Throwable ignored) {
             }
         }
     }
@@ -128,7 +198,10 @@ public class Splitter {
         if (total <= 0) throw new IOException("读取文件大小失败");
 
         long fullUs = durationUsOf(in);
-        if (fullUs <= 0) throw new IOException("读不到视频时长，无法切分");
+        if (fullUs <= 0) {
+            throw new IOException("读不到视频时长，无法切分：" + in.getName()
+                    + "（" + (in.length() / 1024 / 1024) + " MB）");
+        }
         // 支持裁掉开头 / 结尾：算段数时只用有效时长
         long durUs = fullUs;
         if (startUs > 0 && startUs < durUs) durUs -= startUs;

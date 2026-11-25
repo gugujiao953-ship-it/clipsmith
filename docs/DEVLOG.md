@@ -1187,3 +1187,50 @@ src/com/zhuanz/bilislicer/
 - 只取免登录的 360P（html5 通道上限），大会员高清片源拿不到——正好符合「最低画质」的需求
 - 付费/下架/地区限制的视频会提示取流失败
 - 长视频（1 小时以上）在手机上压缩比较慢，建议段数留空走无损切
+
+## v6.5 有些视频读不到时长：三级兜底
+
+### 现象
+
+处理某些视频时报「读不到视频时长，无法切分」，片库里这些片段也不显示时长。
+
+### 根因
+
+系统 API 对**碎片化 MP4（fMP4）**这类容器给不出时长。实测：
+
+```
+t_frag.mp4（ffmpeg -movflags frag_keyframe+empty_moov）  → MediaStore duration=0
+t_hevc.mp4（普通 MP4，HEVC）                             → MediaStore duration=6000
+```
+
+而旧代码里读时长有两套，标准不一：
+
+- `Pipeline.durationOf`：MediaExtractor → MediaMetadataRetriever（两级）
+- `Splitter.durationUsOf`：**只有 MediaMetadataRetriever**（一级）
+
+MediaMetadataRetriever 恰恰是对 fMP4、缺 moov 时长、带 elst 编辑列表的文件最不擅长的那个。
+所以切分阶段最容易炸 —— 报的就是那句「读不到视频时长」。
+
+这类文件通常来自：抖音/快手导出的流式 MP4、HLS 转存、部分剪辑软件或录屏工具；
+还有一种是自己产物 —— 如果源本身够小、不需要压缩，我们是**原样复制**，
+容器里没有时长，它就一路继承下去。
+
+### 改法：三级兜底
+
+```java
+1) MediaExtractor 读轨道头 KEY_DURATION   // 几毫秒，最稳
+2) MediaMetadataRetriever                 // 老办法
+3) 逐样本推进到结尾取最后时间戳             // 不解码，只读包头，几千样本几十毫秒
+```
+
+- `Splitter.durationUsOf` 与 `Pipeline` 统一走这一套
+- 片库侧也补了兜底：MediaStore 给的 `durMs` 为 0 时，本地读一次再显示
+  （只对异常文件触发，不影响正常列表速度）
+- 三级都失败时的报错会带上文件名与大小，便于定位是哪个文件
+
+### 实测
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 处理 t_frag.mp4（fMP4） | 读不到时长 → 失败 | 处理成功 |
+| 片库显示该片段 | 无时长 | `1 段 · 0.52 MB · 0:06` |

@@ -100,6 +100,13 @@ public class Library {
                 if (it.relPath == null) it.relPath = ROOT + "/";
                 it.uri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, it.id);
 
+                // 碎片 MP4（fMP4）这类容器，MediaStore 给的 duration 就是 0，
+                // 列表里会显示成没有时长 —— 本地读一次兜底（只对异常文件执行）
+                if (it.durMs <= 0 && it.path != null) {
+                    long us = Splitter.durationUsOf(new java.io.File(it.path));
+                    if (us > 0) it.durMs = us / 1000;
+                }
+
                 Group g = map.get(it.relPath);
                 if (g == null) {
                     g = new Group();

@@ -234,35 +234,16 @@ public class Pipeline {
 
     /** 从文件里读真实时长（各平台都给不准，直接读最稳） */
     static long durationOf(File f) {
-        // 先走 MediaExtractor 读轨道里的 duration，比 MediaMetadataRetriever 快很多
-        android.media.MediaExtractor ex = new android.media.MediaExtractor();
-        try {
-            ex.setDataSource(f.getAbsolutePath());
-            long best = 0;
-            for (int i = 0; i < ex.getTrackCount(); i++) {
-                android.media.MediaFormat mf = ex.getTrackFormat(i);
-                if (mf.containsKey(android.media.MediaFormat.KEY_DURATION)) {
-                    best = Math.max(best, mf.getLong(android.media.MediaFormat.KEY_DURATION) / 1000);
-                }
-            }
-            if (best > 0) return best;
-        } catch (Throwable ignored) {
-        } finally {
-            try {
-                ex.release();
-            } catch (Throwable ignored) {
-            }
-        }
-        android.media.MediaMetadataRetriever r = new android.media.MediaMetadataRetriever();
-        try {
-            r.setDataSource(f.getAbsolutePath());
-            String d = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION);
-            return d == null ? 0 : Long.parseLong(d);
-        } catch (Throwable t) {
-            return 0;
-        } finally {
-            try { r.release(); } catch (Throwable ignored) { }
-        }
+        long us = durationUsOf(f);
+        return us > 0 ? us / 1000 : 0;
+    }
+
+    /** 微秒级时长，三级兜底（与 Splitter 保持一致） */
+    static long durationUsOf(File f) {
+        long us = Splitter.durationUsOf(f);
+        if (us > 0) return us;
+        android.util.Log.w("BiliSlicer", "duration unreadable: " + f.getName());
+        return 0;
     }
 
     public static Result run(Context ctx, String url, double limitMb, int wantParts,
