@@ -609,6 +609,10 @@ public class Pipeline {
                             checkCancel();
                             if (prog != null) prog.pct(90 + part * 10 / Math.max(1, total));
                         });
+                if (r.parts != r.planned) {
+                    log.line("   关键帧不够密：本来切 " + r.planned + " 段，改成 " + r.parts
+                            + " 段（否则会切出几秒的碎片）");
+                }
                 outs.addAll(r.files);
             }
 

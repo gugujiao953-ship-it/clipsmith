@@ -26,6 +26,7 @@ public class Splitter {
     public static class Result {
         public List<File> files = new ArrayList<>();
         public int parts;
+        public int planned;   // 原本打算切几段（关键帧不够密时会变少）
     }
 
     /** 用一帧一帧的样本大小累加，不做解码，很快 */
@@ -216,27 +217,55 @@ public class Splitter {
 
         List<Long> syncs = syncTimes(in);
         {
-            // 切点 = 平均分段的边界，再吸附到关键帧
+            // 切点 = 平均分段的边界，再吸附到关键帧。
+            //
+            // 这里有两个坑，都会切出垃圾段：
+            //  a) 「吸附到最近关键帧」没有距离上限。关键帧稀疏的片子（长 GOP、录屏、第三方转码）
+            //     只有开头和结尾两个关键帧时，中间切点会被吸到结尾 —— 于是第一段 53 秒、
+            //     第二段 1 秒，看着就像「后面的都没了」。
+            //  b) 尾段没有最短长度保护，差一点点就多切出一段。
+            //
+            // 现在的策略：只在目标点附近（step 的 25%）找关键帧；找不到就**放弃这个切点**
+            // （宁可少切一段，也不从非关键帧开始 —— 那样开头会花屏直到下一个关键帧）。
             long stepUs = durUs / n;
+            long tol = Math.max(1_000_000L, stepUs / 4);
+            long endBound = (endUs > 0 && endUs < fullUs) ? endUs : (startUs + durUs);
+            long minPart = Math.min(stepUs / 3, 3_000_000L);
+
             List<Long> cutUs = new ArrayList<>();
             for (int k = 1; k < n; k++) {
                 long targetUs = startUs + stepUs * k;
-                long best = targetUs;
+                long best = -1;
                 long bestDiff = Long.MAX_VALUE;
                 for (long sy : syncs) {
                     long d = Math.abs(sy - targetUs);
-                    if (d < bestDiff) {
+                    if (d < bestDiff && d <= tol) {
                         bestDiff = d;
                         best = sy;
                     }
                 }
-                if (!cutUs.isEmpty() && best <= cutUs.get(cutUs.size() - 1)) {
-                    best = cutUs.get(cutUs.size() - 1) + 1_000_000L;
-                }
+                if (best < 0) continue;                       // 附近没关键帧，这个切点放弃
+                if (!cutUs.isEmpty() && best - cutUs.get(cutUs.size() - 1) < minPart) continue;
+                if (endBound - best < minPart) continue;      // 会切出过短的尾段，放弃
                 cutUs.add(best);
             }
+
+            // 相邻段太近的也合并掉（保留后一个，前一段并进后一段）
+            for (int i = cutUs.size() - 1; i > 0; i--) {
+                if (cutUs.get(i) - cutUs.get(i - 1) < minPart) cutUs.remove(i - 1);
+            }
+
+            final int plan0 = n;
+            int realN = cutUs.size() + 1;
+            if (realN != n) {
+                Log.i("BiliSlicer", "  切点调整：" + n + " 段 -> " + realN
+                        + " 段（关键帧不够密，避免切出极短段）");
+            }
+            n = realN;
+
             Result r = new Result();
             r.parts = n;
+            r.planned = plan0;
             long[] bounds = new long[n + 1];
             bounds[0] = Math.max(0, startUs);
             for (int i = 0; i < cutUs.size(); i++) bounds[i + 1] = cutUs.get(i);

@@ -243,24 +243,37 @@ public class MainActivity extends Activity implements Jobs.Listener {
             } catch (Exception ignored) {
             }
             String sig = url + "#" + ts;
-            if (sig.equals(lastClipSig)) return;
+            // 注意：小米等 ROM 上「重新复制同一段文字」不会更新剪贴板时间戳，
+            // 所以不能只比 sig —— 否则同一条链接复制第二遍永远不会再处理。
+            // 这里改成「内容相同且发生在 30 秒内」才算重复，过了窗口就当作新的一次复制。
+            long lastAt = prefs.getLong("lastClipAt", 0);
+            boolean same = sig.equals(lastClipSig)
+                    && System.currentTimeMillis() - lastAt < 30_000L;
+            if (same) return;
             // 处理中也照样收：会自动排到队尾（以前这里直接 return，新链接被丢掉）
             // 只留一个很短的保护窗口，避免刚点完按钮就被剪贴板抢走焦点
-            if (System.currentTimeMillis() - userActedAt < 1200) return;
-            // 已经成功处理过的链接不再自动跑：否则每次切回应用都会把最后那条又弹一遍。
-            // 想重下就手动点「粘贴」或去处理记录里重试。
-            if (History.has(this, History.keyOf(url))) {
-                lastClipSig = sig;
-                prefs.edit().putString("lastClipSig", sig).apply();
+            if (System.currentTimeMillis() - userActedAt < 1200) {
+                android.util.Log.i("BiliSlicer", "clip skip: just acted");
                 return;
             }
+            // 说明：这里以前还会检查「这条是不是下过」，下过就静默跳过。
+            // 结果是——处理中从别的 app 复制一条以前下过的链接，回到应用什么都不发生，
+            // 看起来就像「复制了但没人理」。
+            // 去重已经由上面的「剪贴板时间戳」负责（同一条内容只处理一次），
+            // 所以这里不再因为历史记录而丢弃用户主动复制的链接。
             // 用户正在输入框里编辑时不抢，免得把人家打的字冲掉
-            if (input != null && input.hasFocus() && input.getText().length() > 0) return;
+            if (input != null && input.hasFocus() && input.getText().length() > 0) {
+                android.util.Log.i("BiliSlicer", "clip skip: input focused");
+                return;
+            }
             lastClipSig = sig;
-            prefs.edit().putString("lastClipSig", sig).apply();
+            prefs.edit().putString("lastClipSig", sig)
+                    .putLong("lastClipAt", System.currentTimeMillis()).apply();
             lastHandled = url;
             prefs.edit().putString("lastUrl", url).apply();
             input.setText(url);
+            android.util.Log.i("BiliSlicer", "clip enqueue " + url);
+            android.util.Log.i("BiliSlicer", "clip enqueue " + url);
             log("🔗 识别到链接，开始处理");
             enqueueAll(url);
         } catch (Exception ignored) {
