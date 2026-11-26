@@ -230,7 +230,9 @@ public class Splitter {
             long stepUs = durUs / n;
             long tol = Math.max(1_000_000L, stepUs / 4);
             long endBound = (endUs > 0 && endUs < fullUs) ? endUs : (startUs + durUs);
-            long minPart = Math.min(stepUs / 3, 3_000_000L);
+            // 最小段长不能太小：太小时第一个切点会紧贴片头，
+            // 切出来的首段只有几帧（甚至 0 字节），入库时被丢掉就等于丢内容。
+            long minPart = Math.max(3_000_000L, stepUs / 3);
 
             List<Long> cutUs = new ArrayList<>();
             for (int k = 1; k < n; k++) {

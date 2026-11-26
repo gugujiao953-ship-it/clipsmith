@@ -112,15 +112,30 @@ public class Transcoder {
         // 有 Surface 直通成功的记录就用它（硬件直通，比 YUV 搬运快得多）
         boolean surfaceFirst = path.isEmpty() || "surface".equals(path);
         if (surfaceFirst) {
+            // 直通路径必须写临时文件：它中途失败时留下的 MediaMuxer
+            // 还攥着同一个输出文件，会在十几秒后把后面 YUV 写好的内容清成 0 字节。
+            // 这是「第一段总是没有」的根源。
+            File sfTmp = new File(out.getAbsolutePath() + ".sf.tmp");
             try {
-                surface(in, out, videoBitrate, maxWidth, keyframeSec, durationHintMs, cb);
-                Log.i(TAG, "transcode OK surface " + (System.currentTimeMillis() - t0) + "ms");
-                return;
+                //noinspection ResultOfMethodCallIgnored
+                sfTmp.delete();
+                surface(in, sfTmp, videoBitrate, maxWidth, keyframeSec, durationHintMs, cb);
+                if (sfTmp.length() > 0 && sfTmp.renameTo(out)) {
+                    Log.i(TAG, "transcode OK surface " + (System.currentTimeMillis() - t0) + "ms");
+                    notePath("surface");
+                    return;
+                }
+                throw new java.io.IOException("surface 产物为空");
             } catch (Pipeline.Canceled c) {
+                //noinspection ResultOfMethodCallIgnored
+                sfTmp.delete();
                 throw c;
             } catch (Exception e) {
+                //noinspection ResultOfMethodCallIgnored
+                sfTmp.delete();
                 Log.w(TAG, "surface 失败，改走 YUV: " + e);
                 path = "yuv";
+                surfaceBroken = true;
             }
         }
         try {

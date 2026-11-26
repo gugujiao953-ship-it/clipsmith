@@ -233,7 +233,12 @@ public class Pipeline {
         File segDir = new File(work, "seg");
         //noinspection ResultOfMethodCallIgnored
         segDir.mkdirs();
-        Splitter.Result r = Splitter.split(src, segDir, base, partBytes, partUs,
+        // 这里只按时间切：压缩后的体积由码率决定，跟源文件大小无关。
+        // 传 partBytes 会把段数拉回「源大小 ÷ 每段上限」，切得比需要更碎。
+        // 传一个「比整个文件还大」的字节上限，让段数只由 partUs 决定。
+        // 用 Long.MAX_VALUE 会在这个类内部做乘法时溢出，反而算出错的段数。
+        long ignoreBytes = Math.max(1L, src.length() * 2L);
+        Splitter.Result r = Splitter.split(src, segDir, base, ignoreBytes, partUs,
                 startUs, endUs, null);
         java.util.List<File> segs = r.files;
         Diag.line("切段待压", segs.size() + " 段");
@@ -244,6 +249,8 @@ public class Pipeline {
             File seg = segs.get(i);
             File out = new File(outDir, seg.getName());
             long segDurMs = durationUsOf(seg) / 1000;
+            Diag.line("段源", (i + 1) + "/" + segs.size() + " " + seg.getName()
+                    + " " + Library.mb(seg.length()) + " " + segDurMs + "ms");
             boolean ok = false;
             if (segDurMs > 0) {
                 try {
@@ -362,7 +369,19 @@ public class Pipeline {
                 copyFile(seg, out);
                 log.line("   ⚠ 第 " + (i + 1) + " 段压缩失败，保留原画质");
             }
-            outs.add(out);
+            if (out.length() <= 0) {
+                // 兜到底：宁可放未压缩的这一段，也不能给 0 字节文件（会被入库丢掉 → 丢内容）
+                Diag.line("空段兜底", seg.getName() + " seg=" + Library.mb(seg.length()));
+                //noinspection ResultOfMethodCallIgnored
+                out.delete();
+                try {
+                    copyFile(seg, out);
+                } catch (Exception ignored) {
+                }
+            }
+            Diag.line("段产出", (i + 1) + "/" + segs.size() + " " + Library.mb(out.length())
+                    + (out.length() > 0 ? "" : " ←空!"));
+            if (out.length() > 0) outs.add(out);
             // 给编码器实例留点回收时间，不然下一段容易 start failed
             try {
                 Thread.sleep(80);
@@ -998,7 +1017,17 @@ public class Pipeline {
                     // 留两成余量才能真正把每段装进 9MB 里
                     // 段长按目标来切。音轨修好之后（不再把视频帧写进音轨），
                     // 每段大约 4.5MB，离 9MB 上限还有余量。
-                    long segUs = (long) (Math.max(6.0, partSec) * 1_000_000L);
+                    // 段长按「成品」码率算。原片 1.9Mbps，压完只有 0.98Mbps
+                    // （视频 855k + 音频 128k），按原片码率算会把段切得过碎 ——
+                    // 每段才 30 秒、只占 3MB 多，明明还有大把额度。
+                    int outKbps = videoKbps + Math.max(48, AudioFix.audioKbpsMeasured(raw));
+                    // bytes×8 是 bits，除以 kbps×1000 才是秒；留 8% 余量
+                    double segSec = partBytes * 8.0 / (Math.max(200, outKbps) * 1000.0) * 0.92;
+                    segSec = Math.min(240.0, Math.max(8.0, segSec));
+                    long segUs = (long) (segSec * 1_000_000L);
+                    Diag.line("段长", String.format(Locale.CHINA,
+                            "%.0f 秒/段（成品 %dk，每段上限 %.1fMB）",
+                            segSec, outKbps, partBytes / 1e6));
                     partOuts = encodeInParts(encodeSrc, outDir, base, segUs, (long) partBytes,
                             videoKbps, needCompress4Total ? targetWidth : 854,
                             preTrimStart, preTrimEnd, work, log, prog);
@@ -1098,6 +1127,9 @@ public class Pipeline {
                 }
             }
 
+            for (File f : outs) {
+                Diag.line("待入库", f.getName() + " " + Library.mb(f.length()));
+            }
             // 0 字节的段直接剔掉，别在片库里留空文件
             for (int i = outs.size() - 1; i >= 0; i--) {
                 if (outs.get(i).length() <= 0) {
