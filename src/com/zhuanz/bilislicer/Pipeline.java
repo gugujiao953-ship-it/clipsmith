@@ -217,6 +217,255 @@ public class Pipeline {
         public final List<Uri> uris = new ArrayList<>();
     }
 
+    /**
+     * 先按时间把源切成若干段，再逐段转码。
+     *
+     * 为什么不用「整片转码再切」：这台机器上整片转码的产物一旦到 60MB 量级，
+     * MediaMuxer 收尾就会失败（moov 不落盘），文件读不到时长也没法播。
+     * 拆成十来兆的小段后每段都能正常收尾，顺带码率控制也更准。
+     */
+    static java.util.List<File> encodeInParts(File src, File outDir, String base, long partUs,
+                                              long partBytes, int kbps, int width,
+                                              long startUs, long endUs,
+                                              File work, Log log, Progress prog)
+            throws Exception {
+        java.util.List<File> outs = new java.util.ArrayList<>();
+        File segDir = new File(work, "seg");
+        //noinspection ResultOfMethodCallIgnored
+        segDir.mkdirs();
+        Splitter.Result r = Splitter.split(src, segDir, base, partBytes, partUs,
+                startUs, endUs, null);
+        java.util.List<File> segs = r.files;
+        Diag.line("切段待压", segs.size() + " 段");
+        final int segTotal = Math.max(1, segs.size());
+        for (int i = 0; i < segs.size(); i++) {
+            checkCancel();
+            final int segNo = i;
+            File seg = segs.get(i);
+            File out = new File(outDir, seg.getName());
+            long segDurMs = durationUsOf(seg) / 1000;
+            boolean ok = false;
+            if (segDurMs > 0) {
+                try {
+                    Transcoder.transcode(seg, out, kbps * 1000, width, 1, segDurMs, pct -> {
+                        checkCancel();
+                        if (prog != null) {
+                            prog.pct(55 + (segNo * 100 + pct) * 35 / segTotal / 100);
+                        }
+                    });
+                    ok = durationUsOf(out) > 0;
+                    if (!ok) Diag.line("分段产物异常", seg.getName() + " " + Library.mb(out.length()));
+                    // 这台机器的编码器不老实按码率走（实测能超发到 2-3 倍），
+                    // 所以压完看体积，超了就按比例重压一次，保证每段真的装得下。
+                    if (ok && out.length() > partBytes * 11 / 10 && segDurMs > 0) {
+                        int kbps2 = (int) Math.max(150,
+                                (double) kbps * partBytes / Math.max(1, out.length()));
+                        Diag.line("超发重压", seg.getName() + " " + Library.mb(out.length())
+                                + " @" + kbps + "k -> " + kbps2 + "k");
+                        //noinspection ResultOfMethodCallIgnored
+                        out.delete();
+                        try {
+                            Transcoder.transcode(seg, out, kbps2 * 1000, width, 1, segDurMs, null);
+                            ok = durationUsOf(out) > 0;
+                        } catch (Pipeline.Canceled c) {
+                            throw c;
+                        } catch (Exception e) {
+                            ok = false;
+                        }
+                        // 降码率都不管用（这台机器的编码器不认码率参数），
+                        // 那就只能从分辨率下手，画面小一半数据量自然下来。
+                        if (ok && out.length() > partBytes * 11 / 10) {
+                            int w2 = Math.max(400, width * 2 / 3);
+                            Diag.line("降分辨率重压", seg.getName() + " " + Library.mb(out.length())
+                                    + " 宽" + width + " -> " + w2);
+                            //noinspection ResultOfMethodCallIgnored
+                            out.delete();
+                            try {
+                                Transcoder.transcode(seg, out, kbps2 * 1000, w2, 1, segDurMs, null);
+                                ok = durationUsOf(out) > 0;
+                            } catch (Pipeline.Canceled c) {
+                                throw c;
+                            } catch (Exception e) {
+                                ok = false;
+                            }
+                        }
+                    }
+                } catch (Pipeline.Canceled c) {
+                    throw c;
+                } catch (Exception e) {
+                    Diag.line("分段转码异常", seg.getName() + " " + e);
+                    // 这台机器同时能开的硬编码器实例有限（常见的就 2 个），
+                    // 连续分段时容易撞上「start failed」——等实例回收后重试一次。
+                    if (String.valueOf(e.getMessage()).contains("start failed")) {
+                        try {
+                            Thread.sleep(400);
+                        } catch (InterruptedException ignored) {
+                        }
+                        try {
+                            Transcoder.transcode(seg, out, kbps * 1000, width, 1, segDurMs, null);
+                            ok = durationUsOf(out) > 0;
+                        } catch (Exception e2) {
+                            Diag.line("分段转码重试失败", seg.getName() + " " + e2);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            if (!ok) {
+                // 这一段没压成：直接用未压缩的段，至少能播
+                //noinspection ResultOfMethodCallIgnored
+                out.delete();
+                copyFile(seg, out);
+                log.line("   ⚠ 第 " + (i + 1) + " 段压缩失败，保留原画质");
+            }
+            outs.add(out);
+            // 给编码器实例留点回收时间，不然下一段容易 start failed
+            try {
+                Thread.sleep(80);
+            } catch (InterruptedException ignored) {
+            }
+        }
+        return outs;
+    }
+
+    /** 采样几百帧看时间戳是否重复/回退（坏容器的典型症状） */
+    static boolean timestampsLookBroken(File f) {
+        android.media.MediaExtractor ex = new android.media.MediaExtractor();
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            int v = -1;
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                String m = ex.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME);
+                if (m != null && m.startsWith("video/")) {
+                    v = i;
+                    break;
+                }
+            }
+            if (v < 0) return false;
+            ex.selectTrack(v);
+            long last = Long.MIN_VALUE;
+            int n = 0, bad = 0;
+            while (n < 800) {
+                long t = ex.getSampleTime();
+                if (t < 0) break;
+                if (t <= last) bad++;
+                last = t;
+                n++;
+                if (!ex.advance()) break;
+            }
+            return n > 60 && bad > n / 20;   // 超过 5% 重复/回退就当坏了
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            try {
+                ex.release();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * 只重写时间轴，不动画面数据：按轨道分别用「样本序号 × 帧长」给新时间戳。
+     * 拷贝很快（不解码），但能让时长、码率、切分全部回到正常轨道。
+     */
+    static void normalizeTimestamps(File in, File out) throws Exception {
+        android.media.MediaExtractor ex = new android.media.MediaExtractor();
+        ex.setDataSource(in.getAbsolutePath());
+        android.media.MediaMuxer mux = new android.media.MediaMuxer(out.getAbsolutePath(),
+                android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        int tracks = ex.getTrackCount();
+        int[] map = new int[tracks];
+        java.util.Arrays.fill(map, -1);
+        long[] frameUs = new long[tracks];
+        long[] idx = new long[tracks];
+        int vTrack = -1;
+        boolean started = false;
+        try {
+            for (int i = 0; i < tracks; i++) {
+                android.media.MediaFormat mf = ex.getTrackFormat(i);
+                String m = mf.getString(android.media.MediaFormat.KEY_MIME);
+                try {
+                    map[i] = mux.addTrack(mf);
+                } catch (Exception e) {
+                    map[i] = -1;
+                    continue;
+                }
+                if (m != null && m.startsWith("video/")) {
+                    int fps = mf.containsKey(android.media.MediaFormat.KEY_FRAME_RATE)
+                            ? mf.getInteger(android.media.MediaFormat.KEY_FRAME_RATE) : 30;
+                    if (fps <= 0 || fps > 120) fps = 30;
+                    frameUs[i] = 1_000_000L / fps;
+                    if (vTrack < 0) vTrack = i;
+                } else {
+                    int sr = mf.containsKey(android.media.MediaFormat.KEY_SAMPLE_RATE)
+                            ? mf.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE) : 44100;
+                    frameUs[i] = 1024L * 1_000_000L / Math.max(8000, sr);
+                }
+                ex.selectTrack(i);
+            }
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect(4 * 1024 * 1024);
+            android.media.MediaCodec.BufferInfo bi = new android.media.MediaCodec.BufferInfo();
+            while (true) {
+                int from = ex.getSampleTrackIndex();
+                if (from < 0) break;
+                if (map[from] >= 0) {
+                    int sz = ex.readSampleData(buf, 0);
+                    if (sz > 0) {
+                        if (!started) {
+                            mux.start();
+                            started = true;
+                        }
+                        bi.offset = 0;
+                        bi.size = sz;
+                        bi.presentationTimeUs = idx[from] * frameUs[from];
+                        bi.flags = ex.getSampleFlags();
+                        mux.writeSampleData(map[from], buf, bi);
+                    }
+                    idx[from]++;
+                }
+                if (!ex.advance()) break;
+            }
+        } finally {
+            try {
+                ex.release();
+            } catch (Throwable ignored) {
+            }
+            if (started) {
+                try {
+                    mux.stop();
+                } catch (Throwable ignored) {
+                }
+            }
+            try {
+                mux.release();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+
+    static void copyFile(File src, File dst) throws Exception {
+        java.nio.channels.FileChannel in = new java.io.FileInputStream(src).getChannel();
+        java.nio.channels.FileChannel out = new java.io.FileOutputStream(dst).getChannel();
+        try {
+            long total = in.size(), done = 0;
+            while (done < total) {
+                long n = in.transferTo(done, total - done, out);
+                if (n <= 0) break;
+                done += n;
+            }
+        } finally {
+            try {
+                in.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                out.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     static void del(File f) {
         if (f == null || !f.exists()) return;
         File[] kids = f.listFiles();
@@ -431,6 +680,24 @@ public class Pipeline {
                          double limitMb, int wantParts, double partMin, int maxKbps,
                          double totalMb, double skipSec, double tailSec,
                          Log log, Progress prog) throws Exception {
+            // 有些下载源（抖音最常见）给的样本时间戳是坏的：大量重复甚至回退。
+            // 后果一路往下传——编码器输出暴涨、muxer 收尾失败、切分切歪。
+            // 这里先不改画质地重写一遍时间轴，后面所有步骤就都正常了。
+            if (timestampsLookBroken(raw)) {
+                try {
+                    File fixed = new File(work, "norm.mp4");
+                    normalizeTimestamps(raw, fixed);
+                    if (durationUsOf(fixed) > 0 && fixed.length() > 10000) {
+                        Diag.line("时间戳异常", "已重写时间轴 " + Library.mb(raw.length())
+                                + " -> " + Library.mb(fixed.length()));
+                        log.line("   源时间戳有问题（重复/回退），已重写时间轴");
+                        raw = fixed;
+                    }
+                } catch (Exception e) {
+                    Diag.line("时间戳归一化失败", e.toString());
+                }
+            }
+
             long rawSize = raw.length();
             long durMs = durationOf(raw);
             Diag.line("素材就绪", "原片 " + Library.mb(rawSize) + "，时长 " + (durMs / 1000) + "s");
@@ -554,6 +821,8 @@ public class Pipeline {
                 // 要裁的话先裁再压：样本级拷贝几乎不耗时，
                 // 省掉的是「把片头几十秒完整解码+编码一遍」的算力
                 File encodeSrc = raw;
+                final long preTrimStart = startUs;
+                final long preTrimEnd = endUs;
                 long encStart = startUs, encEnd = endUs;
                 long encDurMs = durMs;
                 if (startUs > 0 || endUs > 0) {
@@ -575,17 +844,68 @@ public class Pipeline {
                     }
                 }
 
+                // 这台机器上整片转码的产物一旦到几十兆，MediaMuxer 收尾就会失败
+                // （连 ftyp 都没写，读不到时长也不能播）。所以需要压缩时直接走
+                // 「按目标体积切段 → 逐段压」，每段十来兆，稳定且码率更准。
+                boolean encodedInParts = false;
+                java.util.List<File> partOuts = new java.util.ArrayList<>();
+                try {
+                    long segUs = (long) (Math.max(8.0, partSec) * 1_000_000L);
+                    partOuts = encodeInParts(encodeSrc, outDir, base, segUs, (long) partBytes,
+                            videoKbps, needCompress4Total ? targetWidth : 854,
+                            preTrimStart, preTrimEnd, work, log, prog);
+                    encodedInParts = !partOuts.isEmpty();
+                    if (encodedInParts) {
+                        long sum = 0;
+                        for (File f : partOuts) sum += f.length();
+                        // 压完比原片还大就没意义了：扔掉，改用原画质切分
+                        if (sum >= rawSize) {
+                            Diag.line("放弃压缩", "压缩后 " + Library.mb(sum)
+                                    + " ≥ 原片 " + Library.mb(rawSize) + "，改用原画质切分");
+                            log.line("   ⚠ 压缩没效果（比原片还大），改用原画质切分");
+                            for (File f : partOuts) {
+                                //noinspection ResultOfMethodCallIgnored
+                                f.delete();
+                            }
+                            partOuts.clear();
+                            encodedInParts = false;
+                        }
+                    }
+                    if (encodedInParts) {
+                        Diag.line("分段转码", partOuts.size() + " 段，首段 "
+                                + Library.mb(partOuts.get(0).length()));
+                        log.line("   分 " + partOuts.size() + " 段分别压缩（整片一次压会写坏）");
+                    }
+                } catch (Pipeline.Canceled c) {
+                    throw c;
+                } catch (Exception e) {
+                    Diag.line("分段转码失败", e.toString());
+                    log.line("   ⚠ 分段压缩失败：" + e.getMessage());
+                }
+
                 File enc = new File(work, "enc.mp4");
                 boolean encoded = true;
                 final long encT0 = System.currentTimeMillis();
                 Diag.line("开始转码", "目标 " + videoKbps + "k 宽" + (needCompress4Total ? targetWidth : 854));
-                try {
+                if (encodedInParts) {
+                    outs.addAll(partOuts);
+                } else try {
                     Transcoder.transcode(encodeSrc, enc, videoKbps * 1000,
                             needCompress4Total ? targetWidth : 854, 1,
                             encDurMs, pct -> {
                                 checkCancel();
                                 if (prog != null) prog.pct(55 + pct * 35 / 100);
                             });
+                    // 转码「成功」不等于产物可用：muxer 收尾失败时会留下一个没 moov 的
+                    // 大文件，时长读不出来。这里立刻验证，别等到切分时才报错。
+                    if (encoded && durationUsOf(enc) <= 0) {
+                        Diag.line("转码产物异常", "enc.mp4 " + Library.mb(enc.length())
+                                + " 但读不到时长（muxer 收尾失败？）");
+                        //noinspection ResultOfMethodCallIgnored
+                        enc.delete();
+                        encoded = false;
+                        log.line("   ⚠ 转码没写完整，改用原片切分");
+                    }
                 } catch (Pipeline.Canceled c) {
                     throw c;
                 } catch (Exception e) {
@@ -609,6 +929,13 @@ public class Pipeline {
                 File toSplit = encoded ? enc : encodeSrc;
                 long splitStart = preTrimmed ? 0 : startUs;
                 long splitEnd = preTrimmed ? 0 : endUs;
+                if (encodedInParts) {
+                    // 分段压缩时已经切好了，跳过按字节切分
+                    res.parts = outs.size();
+                    for (File f : outs) res.bytes += f.length();
+                    log.line("✓ 完成，共 " + outs.size() + " 个文件");
+                    return res;
+                }
                 log.line("④ 按字节切分…");
                 Splitter.Result r = Splitter.split(toSplit, outDir, base, partBytes, partUs,
                         splitStart, splitEnd,

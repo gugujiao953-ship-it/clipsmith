@@ -302,9 +302,26 @@ public class Splitter {
         long samples = 0;
 
         try {
+            // 只保留第一条视频 + 第一条音频。源里如果带第二条音轨/字幕轨，
+            // 每段都整份拷一遍，产物会比原片还大（实测多出三成多）。
+            boolean gotVideo = false, gotAudio = false;
             for (int i = 0; i < ex.getTrackCount(); i++) {
-                try { trackMap[i] = mux.addTrack(ex.getTrackFormat(i)); }
-                catch (Exception ignored) { trackMap[i] = -1; }
+                String mime = null;
+                try {
+                    mime = ex.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME);
+                } catch (Exception ignored) {
+                }
+                boolean isVideo = mime != null && mime.startsWith("video/");
+                boolean isAudio = mime != null && mime.startsWith("audio/");
+                if (isVideo && gotVideo) { trackMap[i] = -1; continue; }
+                if (isAudio && gotAudio) { trackMap[i] = -1; continue; }
+                try {
+                    trackMap[i] = mux.addTrack(ex.getTrackFormat(i));
+                    if (isVideo) gotVideo = true;
+                    if (isAudio) gotAudio = true;
+                } catch (Exception ignored) {
+                    trackMap[i] = -1;
+                }
             }
             for (int i = 0; i < ex.getTrackCount(); i++) {
                 try { ex.selectTrack(i); } catch (Exception ignored) { }

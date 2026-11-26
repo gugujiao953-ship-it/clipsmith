@@ -21,6 +21,9 @@ import java.nio.ByteBuffer;
  */
 public class TranscoderYuv {
 
+    /** 上一次转码收尾是否失败（mp4 没写完，产物不可用） */
+    static boolean muxBroken;
+
     // 逐帧缩放用的行缓冲（每次转码复用，避免每帧 new byte[]）
     private static byte[] rowBuf;
     private static byte[] dstBuf;
@@ -125,6 +128,14 @@ public class TranscoderYuv {
             boolean inputDone = false;
             boolean encEos = false;
             int guard = 0;
+            muxBroken = false;
+            long outFrameIdx = 0;    // 已编码帧数，时间戳 = 帧号 × 帧间隔
+            int aSampleRate = 44100;
+            long aFrameIdx = 0;
+            final long frameUs = 1_000_000L / Math.max(1, fps);
+            long lastVPts = -1;   // 已写入的最后时间戳，保证单调
+            long lastAPts = -1;
+            int ptsFixed = 0;
             int dropped = 0;      // 编码器来不及吃而丢掉的帧
             int idle = 0;         // 一轮下来什么都没干成的次数
 
@@ -159,7 +170,14 @@ public class TranscoderYuv {
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                         }
                     } else {
-                        if (!feedEncoder(enc, dec, dIdx, vInfo.presentationTimeUs, outW, outH)) {
+                        // 时间戳完全按帧号重算（CFR）。抖音这类源经常给出重复甚至全 0 的
+                        // 时间戳：透传会让编码器输出一堆相同 PTS，MediaMuxer 收尾时报错、
+                        // 文件没有 moov（时长读不到）；按重复点逐个 +1 帧又会把时间轴拉长。
+                        // 我们本来就是固定帧率重编码，直接 frames / fps 最稳。
+                        long feedPts = outFrameIdx * frameUs;
+                        if (feedEncoder(enc, dec, dIdx, feedPts, outW, outH)) {
+                            outFrameIdx++;
+                        } else {
                             dropped++;
                         }
                         did = true;
@@ -193,6 +211,11 @@ public class TranscoderYuv {
                                         Log.i(TAG, "audio mime unsupported for mp4: " + am);
                                     }
                                     aTrack = mux.addTrack(af);
+                                    try {
+                                        aSampleRate = af.getInteger(
+                                                android.media.MediaFormat.KEY_SAMPLE_RATE);
+                                    } catch (Exception ignored) {
+                                    }
                                 } catch (Exception e) {
                                     android.util.Log.w(TAG, "audio track rejected, mute output", e);
                                     aTrack = -1;
@@ -211,6 +234,13 @@ public class TranscoderYuv {
                         if (eb != null) {
                             eb.position(vInfo.offset);
                             eb.limit(vInfo.offset + vInfo.size);
+                            // 编码器偶发给出回退/重复的时间戳，MediaMuxer 会拒绝，
+                            // 结果就是文件写了一大半但 moov 没落盘 —— 时长读不到、整单失败。
+                            if (vInfo.presentationTimeUs <= lastVPts) {
+                                vInfo.presentationTimeUs = lastVPts + 1000;
+                                ptsFixed++;
+                            }
+                            lastVPts = vInfo.presentationTimeUs;
                             mux.writeSampleData(vTrack, eb, vInfo);
                         }
                     }
@@ -233,21 +263,33 @@ public class TranscoderYuv {
             // 4) 音轨直接搬（不重编码）
             if (muxStarted && aTrack >= 0) {
                 ex.selectTrack(aIdx);
+                // 刚才解码视频把轨道读到了文件尾，不回到开头的话音轨会从中间开始、
+                // 时间戳错乱（严重时 muxer 收尾失败）
+                try {
+                    ex.seekTo(0, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                } catch (Exception ignored) {
+                }
                 ByteBuffer ab = ByteBuffer.allocateDirect(256 * 1024);
                 MediaCodec.BufferInfo ai = new MediaCodec.BufferInfo();
+                // AAC 每帧固定 1024 个采样点，时间戳直接按帧号算。
+                // 源里的音频时间戳同样不可靠（重复 / 回退），透传会让 muxer 收尾失败，
+                // 产物变成没有 moov 的裸数据 —— 时长读不到、文件还不能播。
+                long aFrameUs = 1024L * 1_000_000L / Math.max(8000, aSampleRate);
                 while (true) {
                     int sz = ex.readSampleData(ab, 0);
                     if (sz < 0) break;
                     ai.offset = 0;
                     ai.size = sz;
-                    ai.presentationTimeUs = Math.max(0, ex.getSampleTime() + shift);
+                    ai.presentationTimeUs = aFrameIdx * aFrameUs;
                     ai.flags = ex.getSampleFlags();
+                    aFrameIdx++;
                     mux.writeSampleData(aTrack, ab, ai);
                     ex.advance();
                 }
             }
             Log.i(TAG, "yuv transcode done size=" + out.length()
-                    + " drop=" + dropped + " idle=" + idle + " loops=" + guard);
+                    + " drop=" + dropped + " idle=" + idle + " loops=" + guard
+                    + " ptsFixed=" + ptsFixed);
         } finally {
             try {
                 if (enc != null) {
@@ -265,7 +307,15 @@ public class TranscoderYuv {
             }
             try {
                 if (mux != null) {
-                    if (muxStarted) mux.stop();
+                    if (muxStarted) {
+                        try {
+                            mux.stop();
+                        } catch (Exception e) {
+                            // 走到这里说明 mp4 没写完（moov 缺失），产物不可用
+                            muxBroken = true;
+                            android.util.Log.w(TAG, "mux.stop() failed: " + e);
+                        }
+                    }
                     mux.release();
                 }
             } catch (Exception ignored) {

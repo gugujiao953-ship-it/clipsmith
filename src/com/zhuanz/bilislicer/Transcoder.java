@@ -140,6 +140,9 @@ public class Transcoder {
         Log.i(TAG, "transcode OK surface " + (System.currentTimeMillis() - t0) + "ms");
     }
 
+    /** Surface 直通在这台机器上是否已确认不可用（试一次就够，别反复建实例） */
+    static volatile boolean surfaceBroken;
+
     private static void notePath(String path) {
         try {
             if (sp != null) sp.edit().putString("encPath2", path).apply();
@@ -151,6 +154,7 @@ public class Transcoder {
     private static void surface(File in, File out, int videoBitrate, int maxWidth,
                                 int keyframeSec, long durationHintMs, Progress cb)
             throws Exception {
+        if (surfaceBroken) throw new IllegalStateException("surface 通道已确认不可用，直接走 YUV");
         String hw = pickHwEncoder();
         // 直通路径只试硬件和默认：软编的 Surface 通道基本都不通，试了纯浪费时间
         String[] names = {hw, null};
@@ -167,6 +171,7 @@ public class Transcoder {
                 if (e instanceof Pipeline.Canceled) throw e;
                 last = e;
                 Log.w(TAG, "surface 尝试#" + i + " 失败（" + names[i] + "）: " + e);
+                surfaceBroken = true;   // 这台机器上直通不通，后续别再浪费实例
             }
         }
         if (last != null) throw last;
