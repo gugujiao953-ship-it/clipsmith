@@ -152,6 +152,8 @@ public class TranscoderYuv {
             muxBroken = false;
             long outFrameIdx = 0;    // 已编码帧数，时间戳 = 帧号 × 帧间隔
             int aSampleRate = 44100;
+            long audioBytes = 0;
+            long audioN = 0;
             long aFrameIdx = 0;
             final long frameUs = 1_000_000L / Math.max(1, fps);
             long lastVPts = -1;   // 已写入的最后时间戳，保证单调
@@ -284,6 +286,14 @@ public class TranscoderYuv {
 
             // 4) 音轨直接搬（不重编码）
             if (muxStarted && aTrack >= 0) {
+                // 必须先把别的轨道取消选中！不然 readSampleData 会在视频/音频之间
+                // 交替返回样本，把视频帧当成音频写进音轨 —— 音轨体积凭空涨十倍。
+                for (int t = 0; t < ex.getTrackCount(); t++) {
+                    try {
+                        ex.unselectTrack(t);
+                    } catch (Exception ignored) {
+                    }
+                }
                 ex.selectTrack(aIdx);
                 // 刚才解码视频把轨道读到了文件尾，不回到开头的话音轨会从中间开始、
                 // 时间戳错乱（严重时 muxer 收尾失败）
@@ -306,12 +316,15 @@ public class TranscoderYuv {
                     ai.flags = ex.getSampleFlags();
                     aFrameIdx++;
                     mux.writeSampleData(aTrack, ab, ai);
+                    audioBytes += sz;
+                    audioN++;
                     ex.advance();
                 }
             }
             Log.i(TAG, "yuv transcode done size=" + out.length()
                     + " drop=" + dropped + " idle=" + idle + " loops=" + guard
                     + " ptsFixed=" + ptsFixed
+                    + " audioSamples=" + audioN + " audioBytes=" + audioBytes
                     + " frames=" + outFrameIdx
                     + " 时长按帧算=" + (outFrameIdx * frameUs / 1_000_000L) + "s"
                     + " hint=" + (durHintMs / 1000) + "s");

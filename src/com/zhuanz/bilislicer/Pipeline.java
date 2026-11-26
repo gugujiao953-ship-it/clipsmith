@@ -255,6 +255,35 @@ public class Pipeline {
                     });
                     ok = durationUsOf(out) > 0;
                     if (!ok) Diag.line("分段产物异常", seg.getName() + " " + Library.mb(out.length()));
+                    // 先看音轨：源音频码率高的话，它才是体积大头，降视频分辨率一点用没有。
+                    // 把音轨重编码到 128k 再换个壳，通常一步就达标。
+                    int srcAudioK = AudioFix.audioKbpsMeasured(seg);
+                    if (ok && out.length() > partBytes && srcAudioK > 192) {
+                        File tinyAudio = new File(work, "a" + i + ".m4a");
+                        File swapped = new File(outDir, "swap_" + seg.getName());
+                        try {
+                            AudioFix.reencode(seg, tinyAudio, 128);
+                            AudioFix.remuxWithAudio(out, tinyAudio, swapped);
+                            if (durationUsOf(swapped) > 0) {
+                                long before = out.length();
+                                //noinspection ResultOfMethodCallIgnored
+                                out.delete();
+                                //noinspection ResultOfMethodCallIgnored
+                                swapped.renameTo(out);
+                                Diag.line("音轨重编码", seg.getName() + " " + Library.mb(before)
+                                        + " -> " + Library.mb(out.length())
+                                        + "（源音频 " + srcAudioK + "k -> 128k）");
+                            } else {
+                                //noinspection ResultOfMethodCallIgnored
+                                swapped.delete();
+                            }
+                        } catch (Exception e) {
+                            Diag.line("音轨重编码失败", e.toString());
+                        } finally {
+                            //noinspection ResultOfMethodCallIgnored
+                            tinyAudio.delete();
+                        }
+                    }
                     // 这台机器的编码器不老实按码率走（实测能超发到 2-3 倍），
                     // 所以压完看体积，超了就按比例重压一次，保证每段真的装得下。
                     if (ok && out.length() > partBytes * 11 / 10 && segDurMs > 0) {
@@ -312,6 +341,19 @@ public class Pipeline {
                         }
                     }
                 }
+            }
+            if (ok && out.length() <= 0) {
+                // 偶尔会产出 0 字节（编码器刚被前一段占着没起来），重试一次
+                //noinspection ResultOfMethodCallIgnored
+                out.delete();
+                try {
+                    Thread.sleep(300);
+                    Transcoder.transcode(seg, out, kbps * 1000, width, 1, segDurMs, null);
+                    ok = durationUsOf(out) > 0 && out.length() > 0;
+                } catch (Exception e) {
+                    ok = false;
+                }
+                if (!ok) Diag.line("空段重试失败", seg.getName());
             }
             if (!ok) {
                 // 这一段没压成：直接用未压缩的段，至少能播
@@ -445,6 +487,76 @@ public class Pipeline {
         }
     }
 
+
+    /**
+     * 把超过上限的段再切一遍，然后统一重命名。
+     *
+     * 关键帧稀的源上，中间的切点会被放弃，剩下没切的内容全压到最后一段
+     * （实测出现过 24MB 的尾巴）。这里对超限的段做浅层递归切分，
+     * 展平后重新编 01/02/03 的段号，保证每一段都接近目标大小。
+     */
+    static java.util.List<File> flattenOversized(java.util.List<File> files, double partBytes,
+                                                 File outDir, String base, File work, Log log) {
+        java.util.List<File> flat = new java.util.ArrayList<>();
+        java.util.List<File> pending = new java.util.ArrayList<>(files);
+        long limit = (long) (partBytes * 1.25);
+        int depth = 0;
+        while (!pending.isEmpty() && depth < 2) {
+            java.util.List<File> next = new java.util.ArrayList<>();
+            for (File f : pending) {
+                if (f.length() <= limit) {
+                    flat.add(f);
+                    continue;
+                }
+                File sub = new File(work, "sub" + depth + "_" + flat.size() + next.size());
+                //noinspection ResultOfMethodCallIgnored
+                sub.mkdirs();
+                try {
+                    Splitter.Result r2 = Splitter.split(f, sub, base, partBytes, 0, 0, 0, null);
+                    if (r2.files.size() > 1) {
+                        Diag.line("末段二次切分", f.getName() + " " + Library.mb(f.length())
+                                + " -> " + r2.files.size() + " 段");
+                        //noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                        next.addAll(r2.files);
+                        continue;
+                    }
+                } catch (Exception e) {
+                    Diag.line("二次切分失败", e.toString());
+                }
+                flat.add(f);
+            }
+            if (next.isEmpty()) break;
+            pending = next;
+            depth++;
+        }
+        flat.addAll(pending);
+
+        // 段号重新编一遍，别出现 01_xxx_1of3_1of2 这种
+        java.util.List<File> named = new java.util.ArrayList<>();
+        int total = flat.size();
+        for (int i = 0; i < total; i++) {
+            File f = flat.get(i);
+            if (total <= 1) {
+                named.add(f);
+                continue;
+            }
+            File dst = new File(outDir, String.format("%02d_%s_%dof%d.mp4", i + 1, base, i + 1, total));
+            if (f.getParentFile() != null && f.getParentFile().equals(outDir) && f.equals(dst)) {
+                named.add(f);
+                continue;
+            }
+            if (f.renameTo(dst)) {
+                named.add(dst);
+            } else {
+                named.add(f);
+            }
+        }
+        if (total != files.size()) {
+            log.line("   超限的段已再切一次，共 " + total + " 段");
+        }
+        return named;
+    }
 
     static void copyFile(File src, File dst) throws Exception {
         java.nio.channels.FileChannel in = new java.io.FileInputStream(src).getChannel();
@@ -727,11 +839,11 @@ public class Pipeline {
             long rawSize = raw.length();
             long durMs = durationOf(raw);
             Diag.line("素材就绪", "原片 " + Library.mb(rawSize) + "，时长 " + (durMs / 1000)
-                    + "s，音频 " + audioKbps(raw) + "k");
-            if (audioKbps(raw) > 320) {
+                    + "s，音频 " + AudioFix.audioKbpsMeasured(raw) + "k");
+            if (AudioFix.audioKbpsMeasured(raw) > 320) {
                 // 音轨是原样拷贝的，源音频码率多高成品就多高。
                 // 高码率音轨会吃掉一半体积，让「每段 9MB」怎么都压不下来。
-                log.line("   ⚠ 源音轨 " + audioKbps(raw) + "k 偏高，会占掉大半体积");
+                log.line("   ⚠ 源音轨 " + AudioFix.audioKbpsMeasured(raw) + "k 偏高，会占掉大半体积");
             }
             log.line("   已下载 " + Library.mb(rawSize));
             if (rawSize < 10000) throw new Exception("下载到的文件异常（可能链接失效）");
@@ -884,9 +996,9 @@ public class Pipeline {
                 try {
                     // 段长按目标的 8 折切：编码器实际输出总比设定大一点，
                     // 留两成余量才能真正把每段装进 9MB 里
-                    // 段长留 20% 余量：音轨是原样拷贝的，源音频码率高时会吃掉大半体积，
-                    // 切得比目标略短一点，每段就能稳稳落在上限以内（差一兆左右无所谓）。
-                    long segUs = (long) (Math.max(6.0, partSec * 0.8) * 1_000_000L);
+                    // 段长按目标来切。音轨修好之后（不再把视频帧写进音轨），
+                    // 每段大约 4.5MB，离 9MB 上限还有余量。
+                    long segUs = (long) (Math.max(6.0, partSec) * 1_000_000L);
                     partOuts = encodeInParts(encodeSrc, outDir, base, segUs, (long) partBytes,
                             videoKbps, needCompress4Total ? targetWidth : 854,
                             preTrimStart, preTrimEnd, work, log, prog);
@@ -949,13 +1061,8 @@ public class Pipeline {
                 File toSplit = encoded ? enc : encodeSrc;
                 long splitStart = preTrimmed ? 0 : startUs;
                 long splitEnd = preTrimmed ? 0 : endUs;
-                if (encodedInParts) {
-                    // 分段压缩时已经切好了，跳过按字节切分
-                    res.parts = outs.size();
-                    for (File f : outs) res.bytes += f.length();
-                    log.line("✓ 完成，共 " + outs.size() + " 个文件");
-                    return res;
-                }
+                // 分段压缩时已经切好，跳过按字节切分（但后面入库不能跳）
+                if (!encodedInParts) {
                 log.line("④ 按字节切分…");
                 Splitter.Result r = Splitter.split(toSplit, outDir, base, partBytes, partUs,
                         splitStart, splitEnd,
@@ -986,10 +1093,21 @@ public class Pipeline {
                     outs.add(whole);
                     r.parts = 1;
                 } else {
-                    outs.addAll(r.files);
+                    outs.addAll(flattenOversized(r.files, partBytes, outDir, base, work, log));
+                }
                 }
             }
 
+            // 0 字节的段直接剔掉，别在片库里留空文件
+            for (int i = outs.size() - 1; i >= 0; i--) {
+                if (outs.get(i).length() <= 0) {
+                    Diag.line("丢弃空段", outs.get(i).getName());
+                    //noinspection ResultOfMethodCallIgnored
+                    outs.get(i).delete();
+                    outs.remove(i);
+                }
+            }
+            if (outs.isEmpty()) throw new Exception("切分没产出任何有效片段");
             log.line("⑤ 存入片库…");
             int cleared = Store.clearExisting(ctx, base);
             if (cleared > 0) log.line("   已清掉同视频的旧片段 " + cleared + " 个");

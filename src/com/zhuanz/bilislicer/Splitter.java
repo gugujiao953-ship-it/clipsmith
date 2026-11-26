@@ -245,7 +245,10 @@ public class Splitter {
                     }
                 }
                 if (best < 0) continue;                       // 附近没关键帧，这个切点放弃
-                if (!cutUs.isEmpty() && best - cutUs.get(cutUs.size() - 1) < minPart) continue;
+                // 第一个切点离片头太近会切出一个几乎空的段（甚至 0 字节，
+                // 入不了库就只能丢掉，等于把开头几十秒内容弄没了）
+                long prevCut = cutUs.isEmpty() ? Math.max(0, startUs) : cutUs.get(cutUs.size() - 1);
+                if (best - prevCut < minPart) continue;
                 if (endBound - best < minPart) continue;      // 会切出过短的尾段，放弃
                 cutUs.add(best);
             }
