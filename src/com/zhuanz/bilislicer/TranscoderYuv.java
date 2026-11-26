@@ -104,7 +104,28 @@ public class TranscoderYuv {
             }
             enc = null;
             String hw = Transcoder.pickHwEncoder();
+            android.util.Log.i(TAG, "cfg " + outW + "x" + outH + " @" + bitrate / 1000 + "k fps=" + fps
+                    + " i=" + keySec + " hw=" + hw);
             if (hw != null) {
+                try {
+                    android.media.MediaCodecInfo ci =
+                            android.media.MediaCodecList.getCodecInfoAt(
+                                    findCodecIndex(hw));
+                    if (ci != null) {
+                        android.media.MediaCodecInfo.VideoCapabilities vc =
+                                ci.getCapabilitiesForType("video/avc").getVideoCapabilities();
+                        android.util.Log.i(TAG, "cap bitrate=" + vc.getBitrateRange()
+                                + " widths=" + vc.getSupportedWidths()
+                                + " heights=" + vc.getSupportedHeights());
+                        android.util.Log.i(TAG, "cap cbrSupported=" + ci.getCapabilitiesForType(
+                                "video/avc").getEncoderCapabilities()
+                                .isBitrateModeSupported(
+                                        android.media.MediaCodecInfo.EncoderCapabilities
+                                                .BITRATE_MODE_CBR));
+                    }
+                } catch (Throwable t) {
+                    android.util.Log.i(TAG, "cap read fail " + t);
+                }
                 try {
                     enc = MediaCodec.createByCodecName(hw);
                 } catch (Exception ignored) {
@@ -200,6 +221,7 @@ public class TranscoderYuv {
                     }
                     if (vInfo.size > 0) {
                         if (!muxStarted) {
+                            android.util.Log.i(TAG, "outputFormat " + enc.getOutputFormat());
                             vTrack = mux.addTrack(enc.getOutputFormat());
                             if (aIdx >= 0) {
                                 // 音轨是 opus / flac / ac3 这类时，MP4 容器可能直接拒收，
@@ -289,7 +311,10 @@ public class TranscoderYuv {
             }
             Log.i(TAG, "yuv transcode done size=" + out.length()
                     + " drop=" + dropped + " idle=" + idle + " loops=" + guard
-                    + " ptsFixed=" + ptsFixed);
+                    + " ptsFixed=" + ptsFixed
+                    + " frames=" + outFrameIdx
+                    + " 时长按帧算=" + (outFrameIdx * frameUs / 1_000_000L) + "s"
+                    + " hint=" + (durHintMs / 1000) + "s");
         } finally {
             try {
                 if (enc != null) {
@@ -325,6 +350,15 @@ public class TranscoderYuv {
     }
 
     /** 把解码出来的一帧 YUV 拷进编码器的输入 Image（顺带缩放） */
+    private static int findCodecIndex(String name) {
+        int n = android.media.MediaCodecList.getCodecCount();
+        for (int i = 0; i < n; i++) {
+            android.media.MediaCodecInfo ci = android.media.MediaCodecList.getCodecInfoAt(i);
+            if (ci.getName().equals(name)) return i;
+        }
+        return -1;
+    }
+
     private static boolean feedEncoder(MediaCodec enc, MediaCodec dec, int dIdx, long pts,
                                        int outW, int outH) throws Exception {
         Image src = dec.getOutputImage(dIdx);

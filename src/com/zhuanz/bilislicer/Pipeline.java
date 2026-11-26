@@ -272,12 +272,14 @@ public class Pipeline {
                         } catch (Exception e) {
                             ok = false;
                         }
-                        // 降码率都不管用（这台机器的编码器不认码率参数），
-                        // 那就只能从分辨率下手，画面小一半数据量自然下来。
-                        if (ok && out.length() > partBytes * 11 / 10) {
-                            int w2 = Math.max(400, width * 2 / 3);
+                        // 码率参数这台编码器不认（它有自己的画质下限），只能降分辨率。
+                        // 一级级往下试，直到真的装进目标体积为止。
+                        int w2 = width;
+                        for (int step = 0; step < 4 && ok
+                                && out.length() > partBytes; step++) {
+                            w2 = Math.max(360, w2 * 3 / 4);
                             Diag.line("降分辨率重压", seg.getName() + " " + Library.mb(out.length())
-                                    + " 宽" + width + " -> " + w2);
+                                    + " 宽" + w2);
                             //noinspection ResultOfMethodCallIgnored
                             out.delete();
                             try {
@@ -483,6 +485,30 @@ public class Pipeline {
 
     /** 从文件里读真实时长（各平台都给不准，直接读最稳） */
     /** 有没有音轨 */
+    /** 源音频码率（kbps），读不到返回 0 */
+    static int audioKbps(File f) {
+        android.media.MediaExtractor ex = new android.media.MediaExtractor();
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                android.media.MediaFormat mf = ex.getTrackFormat(i);
+                String m = mf.getString(android.media.MediaFormat.KEY_MIME);
+                if (m != null && m.startsWith("audio/")) {
+                    if (mf.containsKey(android.media.MediaFormat.KEY_BIT_RATE)) {
+                        return mf.getInteger(android.media.MediaFormat.KEY_BIT_RATE) / 1000;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                ex.release();
+            } catch (Throwable ignored) {
+            }
+        }
+        return 0;
+    }
+
     static boolean hasAudio(File f) {
         android.media.MediaExtractor ex = new android.media.MediaExtractor();
         try {
@@ -700,7 +726,13 @@ public class Pipeline {
 
             long rawSize = raw.length();
             long durMs = durationOf(raw);
-            Diag.line("素材就绪", "原片 " + Library.mb(rawSize) + "，时长 " + (durMs / 1000) + "s");
+            Diag.line("素材就绪", "原片 " + Library.mb(rawSize) + "，时长 " + (durMs / 1000)
+                    + "s，音频 " + audioKbps(raw) + "k");
+            if (audioKbps(raw) > 320) {
+                // 音轨是原样拷贝的，源音频码率多高成品就多高。
+                // 高码率音轨会吃掉一半体积，让「每段 9MB」怎么都压不下来。
+                log.line("   ⚠ 源音轨 " + audioKbps(raw) + "k 偏高，会占掉大半体积");
+            }
             log.line("   已下载 " + Library.mb(rawSize));
             if (rawSize < 10000) throw new Exception("下载到的文件异常（可能链接失效）");
 
@@ -850,27 +882,15 @@ public class Pipeline {
                 boolean encodedInParts = false;
                 java.util.List<File> partOuts = new java.util.ArrayList<>();
                 try {
-                    long segUs = (long) (Math.max(8.0, partSec) * 1_000_000L);
+                    // 段长按目标的 8 折切：编码器实际输出总比设定大一点，
+                    // 留两成余量才能真正把每段装进 9MB 里
+                    // 段长留 20% 余量：音轨是原样拷贝的，源音频码率高时会吃掉大半体积，
+                    // 切得比目标略短一点，每段就能稳稳落在上限以内（差一兆左右无所谓）。
+                    long segUs = (long) (Math.max(6.0, partSec * 0.8) * 1_000_000L);
                     partOuts = encodeInParts(encodeSrc, outDir, base, segUs, (long) partBytes,
                             videoKbps, needCompress4Total ? targetWidth : 854,
                             preTrimStart, preTrimEnd, work, log, prog);
                     encodedInParts = !partOuts.isEmpty();
-                    if (encodedInParts) {
-                        long sum = 0;
-                        for (File f : partOuts) sum += f.length();
-                        // 压完比原片还大就没意义了：扔掉，改用原画质切分
-                        if (sum >= rawSize) {
-                            Diag.line("放弃压缩", "压缩后 " + Library.mb(sum)
-                                    + " ≥ 原片 " + Library.mb(rawSize) + "，改用原画质切分");
-                            log.line("   ⚠ 压缩没效果（比原片还大），改用原画质切分");
-                            for (File f : partOuts) {
-                                //noinspection ResultOfMethodCallIgnored
-                                f.delete();
-                            }
-                            partOuts.clear();
-                            encodedInParts = false;
-                        }
-                    }
                     if (encodedInParts) {
                         Diag.line("分段转码", partOuts.size() + " 段，首段 "
                                 + Library.mb(partOuts.get(0).length()));
@@ -949,7 +969,25 @@ public class Pipeline {
                     log.line("   关键帧不够密：本来切 " + r.planned + " 段，改成 " + r.parts
                             + " 段（否则会切出几秒的碎片）");
                 }
-                outs.addAll(r.files);
+                // 切完比原片还大，说明这个源切不匀（每段都从前面的关键帧起头，内容重叠）。
+                // 与其给用户一堆更大的碎片，不如留下完整的原片。
+                long sumParts = 0;
+                for (File f : r.files) sumParts += f.length();
+                if (!encoded && sumParts > rawSize * 115 / 100) {
+                    Diag.line("切分膨胀", "切出 " + Library.mb(sumParts) + " > 原片 "
+                            + Library.mb(rawSize) + "，改为整片保存");
+                    log.line("   ⚠ 这个源切开会重叠（关键帧太稀），改成整片保存");
+                    for (File f : r.files) {
+                        //noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                    }
+                    File whole = new File(work, base + ".mp4");
+                    if (!raw.renameTo(whole)) whole = raw;
+                    outs.add(whole);
+                    r.parts = 1;
+                } else {
+                    outs.addAll(r.files);
+                }
             }
 
             log.line("⑤ 存入片库…");
